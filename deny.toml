@@ -2,6 +2,16 @@
 ignore = [
   { id = "RUSTSEC-2024-0384", reason = "Transitive via lapin; no safe upgrade available yet" },
   { id = "RUSTSEC-2025-0134", reason = "Transitive via async-nats/tonic stack; awaiting upstream migration" },
+  # quick-xml DoS advisories (quadratic-time dup-attr check; unbounded
+  # namespace-decl allocation). Reachable transitively via the published
+  # mx20022-parse 0.1.1 crate (-> quick-xml ^0.37, locked at 0.37.5). The
+  # newest mx20022-parse (0.3.0) still only requires quick-xml ^0.39, which
+  # is also below the patched >=0.41 line. No in-repo fix is possible until
+  # mx20022-parse publishes a release on quick-xml >=0.41. Residual risk is
+  # DoS against the schema-validator participant; payment messages are
+  # received over authenticated BIC-to-BIC channels, limiting exposure.
+  { id = "RUSTSEC-2026-0194", reason = "Upstream-blocked: mx20022-parse pins quick-xml <0.41; awaiting upstream release on quick-xml >=0.41" },
+  { id = "RUSTSEC-2026-0195", reason = "Upstream-blocked: mx20022-parse pins quick-xml <0.41; awaiting upstream release on quick-xml >=0.41" },
 ]
 
 [licenses]
