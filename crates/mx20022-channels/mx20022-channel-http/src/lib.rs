@@ -387,8 +387,10 @@ mod tests {
         let run_channel = Arc::clone(&channel);
         let handle = tokio::spawn(async move { run_channel.run(tx).await });
 
-        // Wait for the server to be ready.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            mx20022_channels::wait_for_tcp(addr.to_string(), Duration::from_secs(2)).await,
+            "http inbound should become ready within 2s"
+        );
 
         // Send a message before shutdown — should succeed.
         let client = reqwest::Client::new();

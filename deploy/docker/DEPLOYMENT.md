@@ -148,7 +148,10 @@ docker run mxruntime:latest --config /custom/path/config.toml --serve-admin
 The admin bind address defaults to `127.0.0.1:9090` inside the container.
 This is fine for Docker health checks (they run inside the container). If you
 need the admin API accessible from outside, set `admin_bind = "0.0.0.0:9090"`
-in your config's `[runtime]` section.
+and enable `runtime.admin_auth.mode` (`legacy_bearer` or `jwt_hs256`). Binding
+`0.0.0.0` with auth disabled fails closed unless
+`runtime.admin_allow_insecure_bind = true`. The unused HTTP or gRPC bind is
+not checked when that surface is not being served.
 
 ## Environment Variables
 

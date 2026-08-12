@@ -26,15 +26,28 @@ impl std::fmt::Debug for CryptoService {
 }
 
 impl CryptoService {
+    /// Minimum byte length of the HKDF input. Unprefixed keys are raw UTF-8.
+    /// `hex:` and `base64:` prefixes opt in to decode-then-measure.
+    const MIN_MASTER_KEY_BYTES: usize = 32;
+
     pub fn from_master_key(master_key: &str) -> Result<Self, CryptoError> {
-        if master_key.trim().is_empty() {
+        let trimmed = master_key.trim();
+        if trimmed.is_empty() {
             return Err(CryptoError::InvalidMasterKey(
                 "master key must not be empty".to_string(),
             ));
         }
+        let key_material = decode_master_key_material(trimmed)?;
+        if key_material.len() < Self::MIN_MASTER_KEY_BYTES {
+            return Err(CryptoError::InvalidMasterKey(format!(
+                "master key must be at least {} bytes of key material (got {}); unprefixed values are raw UTF-8, or use hex:<64+ hex chars> / base64:<32+ bytes>",
+                Self::MIN_MASTER_KEY_BYTES,
+                key_material.len()
+            )));
+        }
 
         // Derive a fixed-length key for AES-256 using HKDF-SHA256 with a domain-separated salt.
-        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), master_key.as_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), &key_material);
         let mut key_bytes = [0_u8; 32];
         hk.expand(b"aes-256-gcm-key", &mut key_bytes)
             .map_err(|e| CryptoError::InvalidMasterKey(format!("HKDF expand failed: {e}")))?;
@@ -92,6 +105,37 @@ impl CryptoService {
     }
 }
 
+fn decode_master_key_material(trimmed: &str) -> Result<Vec<u8>, CryptoError> {
+    if let Some(hex) = trimmed.strip_prefix("hex:") {
+        return decode_hex(hex).ok_or_else(|| {
+            CryptoError::InvalidMasterKey(
+                "master key hex: prefix requires even-length hex digits".to_string(),
+            )
+        });
+    }
+    if let Some(b64) = trimmed.strip_prefix("base64:") {
+        return STANDARD.decode(b64).map_err(|error| {
+            CryptoError::InvalidMasterKey(format!(
+                "master key base64: prefix is not valid base64: {error}"
+            ))
+        });
+    }
+    Ok(trimmed.as_bytes().to_vec())
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() < 2
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
+        .collect()
+}
+
 impl Drop for CryptoService {
     fn drop(&mut self) {
         self.key_bytes.fill(0);
@@ -121,9 +165,14 @@ pub enum CryptoError {
 mod tests {
     use crate::{CryptoService, EncryptedBlob};
 
+    // 64 raw UTF-8 bytes. Unprefixed hex-looking strings stay raw so existing
+    // deployments keep the same HKDF input.
+    const TEST_MASTER_KEY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto should init");
+        let crypto = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto should init");
 
         let plaintext = b"secret-payment-field";
         let blob = crypto.encrypt(plaintext).expect("encrypt should work");
@@ -139,9 +188,49 @@ mod tests {
     }
 
     #[test]
+    fn rejects_short_master_key() {
+        let result = CryptoService::from_master_key("x");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unprefixed_hex_looking_key_stays_raw_utf8() {
+        let raw = TEST_MASTER_KEY;
+        let prefixed = format!("hex:{raw}");
+        let from_raw = CryptoService::from_master_key(raw).expect("raw key");
+        let from_hex = CryptoService::from_master_key(&prefixed).expect("hex: key");
+        let blob = from_raw.encrypt(b"secret").expect("encrypt");
+        assert!(
+            from_hex.decrypt(&blob).is_err(),
+            "hex: decode must not match raw UTF-8 derivation of the same digits"
+        );
+    }
+
+    #[test]
+    fn prefixed_hex_measures_decoded_bytes() {
+        assert!(CryptoService::from_master_key("hex:0123456789abcdef0123456789abcdef").is_err());
+        assert!(CryptoService::from_master_key(&format!("hex:{TEST_MASTER_KEY}")).is_ok());
+    }
+
+    #[test]
+    fn unprefixed_base64_looking_passphrase_stays_raw() {
+        // 40 alphanumeric chars: valid standard base64 for 30 bytes, so a
+        // silent decode would reject it. Raw UTF-8 is 40 bytes and must pass.
+        let passphrase = "abcdefghijklmnopqrstuvwxyzabcdefghijklmn";
+        assert!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, passphrase).is_ok()
+        );
+        assert!(CryptoService::from_master_key(passphrase).is_ok());
+        assert!(CryptoService::from_master_key(&format!("base64:{passphrase}")).is_err());
+    }
+
+    #[test]
     fn decrypt_fails_with_wrong_key() {
-        let crypto_a = CryptoService::from_master_key("master-key-a").expect("crypto A");
-        let crypto_b = CryptoService::from_master_key("master-key-b").expect("crypto B");
+        let crypto_a = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto A");
+        let crypto_b = CryptoService::from_master_key(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab",
+        )
+        .expect("crypto B");
         let blob = crypto_a.encrypt(b"secret").expect("encrypt");
         let result = crypto_b.decrypt(&blob);
         assert!(result.is_err());
@@ -149,7 +238,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_unsupported_algorithm() {
-        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto");
+        let crypto = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto");
         let blob = EncryptedBlob {
             algorithm: "AES-128-GCM".to_string(),
             nonce_b64: "AAAAAAAAAAAAAAAA".to_string(),
@@ -161,7 +250,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_tampered_ciphertext() {
-        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto");
+        let crypto = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto");
         let mut blob = crypto.encrypt(b"secret").expect("encrypt");
         blob.ciphertext_b64.push('A');
         let result = crypto.decrypt(&blob);

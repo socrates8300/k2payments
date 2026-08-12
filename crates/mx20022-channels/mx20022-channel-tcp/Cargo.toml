@@ -9,5 +9,8 @@ mx20022-channels = { path = "../../mx20022-channels" }
 mx20022-crypto = { path = "../../mx20022-crypto" }
 async-trait.workspace = true
 tokio.workspace = true
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 tracing.workspace = true
 secrecy.workspace = true

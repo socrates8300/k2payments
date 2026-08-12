@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use mx20022_crypto::auth::{constant_time_eq, parse_bearer_token};
+use mx20022_crypto::auth::{constant_time_eq, jwt_required_spec_claims, parse_bearer_token};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -191,6 +191,10 @@ fn authorize_jwt(
     if let Some(aud) = &config.jwt_audience {
         validation.set_audience(&[aud]);
     }
+    validation.set_required_spec_claims(&jwt_required_spec_claims(
+        config.jwt_issuer.as_deref(),
+        config.jwt_audience.as_deref(),
+    ));
 
     let data = decode::<JwtClaims>(
         token,
@@ -274,6 +278,10 @@ mod tests {
         sub: String,
         exp: usize,
         roles: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aud: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iss: Option<String>,
     }
 
     #[test]
@@ -288,6 +296,8 @@ mod tests {
             sub: "operator".to_string(),
             exp: 4_102_444_800,
             roles: vec!["admin.tx.read".to_string()],
+            aud: None,
+            iss: None,
         };
         let token = encode(
             &Header::default(),
@@ -318,6 +328,8 @@ mod tests {
             sub: "readonly".to_string(),
             exp: 4_102_444_800,
             roles: vec!["admin.read".to_string()],
+            aud: None,
+            iss: None,
         };
         let token = encode(
             &Header::default(),
@@ -334,6 +346,122 @@ mod tests {
             None,
         );
         assert!(matches!(result, Err(AuthError::Forbidden)));
+    }
+
+    #[test]
+    fn jwt_audience_required_when_configured() {
+        // jsonwebtoken skips audience validation when the claim is absent.
+        let cfg = AuthConfig {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
+            jwt_audience: Some("mx20022-admin".to_string()),
+            ready_roles: vec!["admin.read".to_string()],
+            ..AuthConfig::default()
+        };
+        let claims_without_aud = Claims {
+            sub: "operator".to_string(),
+            exp: 4_102_444_800,
+            roles: vec!["admin.read".to_string()],
+            aud: None,
+            iss: None,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims_without_aud,
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header = format!("Bearer {token}");
+
+        let result = authorize_request(&cfg, AdminResource::Ready, Some(header.as_str()), None);
+        assert!(
+            matches!(result, Err(AuthError::InvalidBearer)),
+            "token missing aud should be rejected: {result:?}"
+        );
+
+        // A token carrying the configured audience is accepted.
+        let claims_with_aud = Claims {
+            sub: "operator".to_string(),
+            exp: 4_102_444_800,
+            roles: vec!["admin.read".to_string()],
+            aud: Some("mx20022-admin".to_string()),
+            iss: None,
+        };
+        let token_ok = encode(
+            &Header::default(),
+            &claims_with_aud,
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header_ok = format!("Bearer {token_ok}");
+        let result_ok =
+            authorize_request(&cfg, AdminResource::Ready, Some(header_ok.as_str()), None);
+        assert!(result_ok.is_ok(), "token with correct aud should pass");
+    }
+
+    #[test]
+    fn jwt_rejects_token_without_exp_when_audience_configured() {
+        #[derive(Debug, Serialize)]
+        struct ClaimsNoExp {
+            sub: String,
+            roles: Vec<String>,
+            aud: String,
+        }
+
+        let cfg = AuthConfig {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
+            jwt_audience: Some("mx20022-admin".to_string()),
+            ready_roles: vec!["admin.read".to_string()],
+            ..AuthConfig::default()
+        };
+        let token = encode(
+            &Header::default(),
+            &ClaimsNoExp {
+                sub: "operator".to_string(),
+                roles: vec!["admin.read".to_string()],
+                aud: "mx20022-admin".to_string(),
+            },
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header = format!("Bearer {token}");
+        let result = authorize_request(&cfg, AdminResource::Ready, Some(header.as_str()), None);
+        assert!(
+            matches!(result, Err(AuthError::InvalidBearer)),
+            "token missing exp should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn jwt_issuer_required_when_configured() {
+        let cfg = AuthConfig {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
+            jwt_issuer: Some("mx20022-issuer".to_string()),
+            ready_roles: vec!["admin.read".to_string()],
+            ..AuthConfig::default()
+        };
+        let claims_without_iss = Claims {
+            sub: "operator".to_string(),
+            exp: 4_102_444_800,
+            roles: vec!["admin.read".to_string()],
+            aud: None,
+            iss: None,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims_without_iss,
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header = format!("Bearer {token}");
+
+        let result = authorize_request(&cfg, AdminResource::Ready, Some(header.as_str()), None);
+        assert!(
+            matches!(result, Err(AuthError::InvalidBearer)),
+            "token missing iss should be rejected: {result:?}"
+        );
     }
 
     #[test]

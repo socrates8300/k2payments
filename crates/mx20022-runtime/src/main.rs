@@ -90,6 +90,7 @@ async fn run(
             attempted = recovery.attempted,
             recovered = recovery.recovered,
             failed = recovery.failed,
+            dead_lettered = recovery.dead_lettered,
             limit,
             "startup recovery run completed"
         );
@@ -105,15 +106,18 @@ async fn run(
         .admin_grpc_bind
         .clone()
         .unwrap_or_else(|| "127.0.0.1:9091".to_string());
-    let admin_auth = build_admin_auth(&config);
+    let admin_auth = build_admin_auth(&config)?;
     let admin_tls = build_admin_tls(&config);
     let admin_cors_allowed_origins = config.runtime.admin_cors_allowed_origins.clone();
     let service_mode = (cli.run_pipelines, cli.serve_admin, cli.serve_admin_grpc);
-    if matches!(admin_auth.mode, AdminAuthMode::Disabled)
-        && (cli.serve_admin || cli.serve_admin_grpc)
-    {
-        tracing::warn!("admin auth is disabled while admin service is enabled");
-    }
+    reject_insecure_admin_bind(
+        matches!(admin_auth.mode, AdminAuthMode::Disabled),
+        config.runtime.admin_allow_insecure_bind,
+        cli.serve_admin,
+        cli.serve_admin_grpc,
+        &admin_bind,
+        &admin_grpc_bind,
+    )?;
 
     match service_mode {
         (true, true, true) => {
@@ -352,15 +356,97 @@ fn admin_tls_pair(config: &RuntimeConfig) -> Option<(String, String)> {
     }
 }
 
-fn build_admin_auth(config: &RuntimeConfig) -> AdminAuthConfig {
-    let mode = match config.runtime.admin_auth.mode.as_str() {
-        "disabled" => AdminAuthMode::Disabled,
-        "legacy_bearer" => AdminAuthMode::LegacyBearer,
-        "jwt_hs256" => AdminAuthMode::JwtHs256,
-        _ => AdminAuthMode::Disabled,
-    };
+fn reject_insecure_admin_bind(
+    auth_disabled: bool,
+    allow_insecure: bool,
+    serve_admin: bool,
+    serve_admin_grpc: bool,
+    admin_bind: &str,
+    admin_grpc_bind: &str,
+) -> Result<(), RuntimeBootstrapError> {
+    if !auth_disabled {
+        return Ok(());
+    }
 
-    AdminAuthConfig {
+    let served: Vec<&str> = [
+        serve_admin.then_some(admin_bind),
+        serve_admin_grpc.then_some(admin_grpc_bind),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if served.is_empty() {
+        return Ok(());
+    }
+
+    if allow_insecure {
+        tracing::warn!(
+            binds = ?served,
+            "admin auth is disabled and admin_allow_insecure_bind=true; admin surface is reachable without credentials"
+        );
+        return Ok(());
+    }
+
+    for bind in served {
+        if !is_loopback_bind(bind) {
+            return Err(RuntimeBootstrapError::InsecureAdminBind {
+                bind: bind.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Returns true if `bind` (a `host:port` or `[ip]:port` string) points at a
+/// loopback address. Conservative: only explicit loopback IP literals
+/// (127.0.0.0/8, ::1) and the `localhost` hostname are treated as loopback;
+/// any other value (including `0.0.0.0`, `::`, or a resolvable hostname) is
+/// treated as non-loopback so that the caller fails closed.
+fn is_loopback_bind(bind: &str) -> bool {
+    // Strip a trailing port. SocketAddr::parse handles bracketed IPv6.
+    let candidate = match bind.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => bind,
+    };
+    let host = candidate.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // 127.0.0.0/8 is loopback; ::1 is the IPv6 loopback.
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn admin_auth_mode(mode: &str) -> Result<AdminAuthMode, RuntimeBootstrapError> {
+    match mode {
+        "disabled" => Ok(AdminAuthMode::Disabled),
+        "legacy_bearer" => Ok(AdminAuthMode::LegacyBearer),
+        "jwt_hs256" => Ok(AdminAuthMode::JwtHs256),
+        other => Err(RuntimeBootstrapError::InvalidAdminAuthMode {
+            mode: other.to_string(),
+        }),
+    }
+}
+
+fn build_admin_auth(config: &RuntimeConfig) -> Result<AdminAuthConfig, RuntimeBootstrapError> {
+    let mode = admin_auth_mode(&config.runtime.admin_auth.mode)?;
+    if mode == AdminAuthMode::JwtHs256 {
+        for (name, roles) in [
+            ("ready_roles", &config.runtime.admin_auth.ready_roles),
+            ("status_roles", &config.runtime.admin_auth.status_roles),
+            ("tx_roles", &config.runtime.admin_auth.tx_roles),
+            ("reload_roles", &config.runtime.admin_auth.reload_roles),
+        ] {
+            if roles.iter().all(|role| role.trim().is_empty()) {
+                return Err(RuntimeBootstrapError::AdminJwtMissingRoles {
+                    field: name.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(AdminAuthConfig {
         mode,
         jwt_hs256_secret: config.runtime.admin_auth.jwt_hs256_secret.clone(),
         legacy_bearer_token: config.runtime.admin_auth.legacy_bearer_token.clone(),
@@ -374,7 +460,7 @@ fn build_admin_auth(config: &RuntimeConfig) -> AdminAuthConfig {
         require_mtls_subject: config.runtime.admin_auth.require_mtls_subject,
         mtls_subject_header: config.runtime.admin_auth.mtls_subject_header.clone(),
         mtls_allowed_subjects: config.runtime.admin_auth.mtls_allowed_subjects.clone(),
-    }
+    })
 }
 
 async fn build_admin_controller(
@@ -525,4 +611,75 @@ enum RuntimeBootstrapError {
     AdminGrpcHost(#[from] mx20022_admin::grpc::GrpcHostError),
     #[error(transparent)]
     Engine(#[from] engine::EngineError),
+    #[error("admin service is bound to non-loopback address `{bind}` with auth disabled; refusing to start. Either bind to 127.0.0.1/localhost, enable runtime.admin_auth.mode (legacy_bearer or jwt_hs256), or set runtime.admin_allow_insecure_bind=true to acknowledge the risk")]
+    InsecureAdminBind { bind: String },
+    #[error(
+        "runtime.admin_auth.mode `{mode}` is invalid (expected disabled|legacy_bearer|jwt_hs256)"
+    )]
+    InvalidAdminAuthMode { mode: String },
+    #[error("runtime.admin_auth.{field} must be non-empty when mode=jwt_hs256")]
+    AdminJwtMissingRoles { field: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{admin_auth_mode, is_loopback_bind, reject_insecure_admin_bind};
+
+    #[test]
+    fn loopback_detection_for_ipv4() {
+        assert!(is_loopback_bind("127.0.0.1:9090"));
+        assert!(is_loopback_bind("127.1.2.3:9090")); // 127.0.0.0/8 is loopback
+    }
+
+    #[test]
+    fn loopback_detection_for_ipv6_and_localhost() {
+        assert!(is_loopback_bind("[::1]:9090"));
+        assert!(is_loopback_bind("localhost:9090"));
+        assert!(is_loopback_bind("LOCALHOST:9090"));
+    }
+
+    #[test]
+    fn non_loopback_binds_fail_closed() {
+        assert!(!is_loopback_bind("0.0.0.0:9090"));
+        assert!(!is_loopback_bind("[::]:9090"));
+        assert!(!is_loopback_bind("10.0.0.5:9090"));
+        assert!(!is_loopback_bind("admin.internal:9090"));
+    }
+
+    #[test]
+    fn insecure_bind_check_ignores_unused_admin_surfaces() {
+        let result =
+            reject_insecure_admin_bind(true, false, true, false, "127.0.0.1:9090", "0.0.0.0:9091");
+        assert!(
+            result.is_ok(),
+            "unused gRPC bind must not fail HTTP-only serve: {result:?}"
+        );
+
+        let grpc_only =
+            reject_insecure_admin_bind(true, false, false, true, "0.0.0.0:9090", "127.0.0.1:9091");
+        assert!(
+            grpc_only.is_ok(),
+            "unused HTTP bind must not fail gRPC-only serve: {grpc_only:?}"
+        );
+    }
+
+    #[test]
+    fn insecure_bind_check_rejects_served_non_loopback() {
+        let result =
+            reject_insecure_admin_bind(true, false, true, false, "0.0.0.0:9090", "127.0.0.1:9091");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_admin_auth_mode_fails_closed() {
+        let err = admin_auth_mode("jwt-hs256").expect_err("typo must not become Disabled");
+        assert!(err.to_string().contains("jwt-hs256"));
+    }
+
+    #[test]
+    fn insecure_bind_check_allows_explicit_opt_in() {
+        let result =
+            reject_insecure_admin_bind(true, true, true, true, "0.0.0.0:9090", "0.0.0.0:9091");
+        assert!(result.is_ok());
+    }
 }

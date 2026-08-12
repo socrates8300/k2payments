@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use mx20022_crypto::auth::{constant_time_eq, parse_bearer_token};
+use mx20022_crypto::auth::{constant_time_eq, jwt_required_spec_claims, parse_bearer_token};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -129,6 +129,10 @@ fn authorize_inbound_jwt(
     if let Some(aud) = &config.jwt_audience {
         validation.set_audience(&[aud]);
     }
+    validation.set_required_spec_claims(&jwt_required_spec_claims(
+        config.jwt_issuer.as_deref(),
+        config.jwt_audience.as_deref(),
+    ));
 
     let data = decode::<JwtClaims>(
         token,
@@ -266,5 +270,42 @@ mod tests {
             },
         );
         assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn jwt_rejects_token_without_exp_when_audience_configured() {
+        #[derive(Debug, Serialize)]
+        struct ClaimsNoExp {
+            sub: String,
+            aud: String,
+            roles: Vec<String>,
+        }
+
+        let cfg = InboundAuthConfig {
+            mode: InboundAuthMode::JwtHs256,
+            jwt_hs256_secret: Some(SecretString::new("secret".into())),
+            jwt_audience: Some("mx20022-channel".to_string()),
+            required_roles: vec!["channel.ingress".to_string()],
+            ..InboundAuthConfig::default()
+        };
+        let token = encode(
+            &Header::default(),
+            &ClaimsNoExp {
+                sub: "client".to_string(),
+                aud: "mx20022-channel".to_string(),
+                roles: vec!["channel.ingress".to_string()],
+            },
+            &EncodingKey::from_secret("secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header = format!("Bearer {token}");
+        let denied = authorize_inbound(
+            &cfg,
+            InboundAuthContext {
+                authorization_header: Some(header.as_str()),
+                mtls_subject: None,
+            },
+        );
+        assert!(denied.is_err(), "token missing exp should be rejected");
     }
 }

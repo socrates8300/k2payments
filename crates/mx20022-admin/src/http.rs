@@ -86,7 +86,8 @@ fn run_middleware(request: &HttpRequest, auth: &AuthConfig) -> Result<(), HttpRe
     for stage in DEFAULT_MIDDLEWARE_CHAIN {
         match stage {
             MiddlewareStage::Authentication => {
-                if request.path != "/health" && request.path != "/metrics" {
+                // Only /health is unauthenticated (liveness probe).
+                if request.path != "/health" {
                     let resource = if request.path == "/ready" {
                         AdminResource::Ready
                     } else if request.path == "/status" {
@@ -187,9 +188,11 @@ mod tests {
 
     use mx20022_store::{Store, TransactionRecord};
     use mx20022_store_sqlite::SqliteStore;
+    use secrecy::SecretString;
     use tokio::sync::RwLock;
 
-    use crate::http::{dispatch, HttpRequest};
+    use crate::auth::{AuthConfig, AuthMode};
+    use crate::http::{dispatch, dispatch_with_auth, HttpRequest};
     use crate::routes::HttpMethod;
     use crate::service::{ReloadStatus, RuntimeStatusSnapshot, StoreBackedAdminController};
 
@@ -252,5 +255,122 @@ mod tests {
         )
         .await;
         assert_eq!(tx.status, 200);
+    }
+
+    /// Helper: build a minimal admin controller backed by an in-memory store.
+    /// Used by the authz tests below (status route needs no seeded data).
+    async fn test_controller() -> StoreBackedAdminController {
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
+        StoreBackedAdminController::new(
+            store,
+            RuntimeStatusSnapshot {
+                runtime: "test-runtime".to_string(),
+                pipelines: vec!["demo".to_string()],
+                channels: vec!["http".to_string()],
+                store: "sqlite".to_string(),
+                started_at: SystemTime::now(),
+                reload_status: Arc::new(RwLock::new(ReloadStatus {
+                    config_version: "cfg-v1".to_string(),
+                    last_result: None,
+                    last_reloaded_at: None,
+                })),
+            },
+        )
+    }
+
+    /// Pin the authz status-code mapping for legacy bearer auth: missing
+    /// token -> 401, wrong token -> 401, valid admin token -> 200, valid
+    /// readonly token on a write route -> 403. No test previously exercised
+    /// dispatch_with_auth with a non-Disabled AuthConfig, so a regression
+    /// swapping 401/403 would have shipped undetected.
+    #[tokio::test]
+    async fn legacy_bearer_authz_maps_to_correct_status_codes() {
+        let controller = test_controller().await;
+        let auth = AuthConfig {
+            mode: AuthMode::LegacyBearer,
+            legacy_bearer_token: Some(SecretString::new("admin-token".into())),
+            legacy_readonly_token: Some(SecretString::new("readonly-token".into())),
+            ..AuthConfig::default()
+        };
+
+        let missing = dispatch_with_auth(
+            &controller,
+            HttpRequest {
+                method: HttpMethod::Get,
+                path: "/status".to_string(),
+                bearer_token: None,
+                mtls_subject: None,
+            },
+            &auth,
+        )
+        .await;
+        assert_eq!(missing.status, 401, "missing token should be 401");
+
+        let wrong = dispatch_with_auth(
+            &controller,
+            HttpRequest {
+                method: HttpMethod::Get,
+                path: "/status".to_string(),
+                bearer_token: Some("not-the-token".to_string()),
+                mtls_subject: None,
+            },
+            &auth,
+        )
+        .await;
+        // A presented-but-unrecognized token is Forbidden (403), not 401:
+        // the caller supplied credentials; they just don't match. This pins
+        // the 401-vs-403 boundary in authorize_legacy.
+        assert_eq!(
+            wrong.status, 403,
+            "presented-but-unrecognized token should be 403"
+        );
+
+        let admin_ok = dispatch_with_auth(
+            &controller,
+            HttpRequest {
+                method: HttpMethod::Get,
+                path: "/status".to_string(),
+                bearer_token: Some("admin-token".to_string()),
+                mtls_subject: None,
+            },
+            &auth,
+        )
+        .await;
+        assert_eq!(admin_ok.status, 200, "valid admin token should be 200");
+
+        // Readonly token is allowed on /status (read)...
+        let readonly_read = dispatch_with_auth(
+            &controller,
+            HttpRequest {
+                method: HttpMethod::Get,
+                path: "/status".to_string(),
+                bearer_token: Some("readonly-token".to_string()),
+                mtls_subject: None,
+            },
+            &auth,
+        )
+        .await;
+        assert_eq!(
+            readonly_read.status, 200,
+            "readonly token on read route should be 200"
+        );
+
+        // ...but forbidden on /reload (write).
+        let readonly_write = dispatch_with_auth(
+            &controller,
+            HttpRequest {
+                method: HttpMethod::Post,
+                path: "/reload".to_string(),
+                bearer_token: Some("readonly-token".to_string()),
+                mtls_subject: None,
+            },
+            &auth,
+        )
+        .await;
+        assert_eq!(
+            readonly_write.status, 403,
+            "readonly token on write route should be 403"
+        );
     }
 }

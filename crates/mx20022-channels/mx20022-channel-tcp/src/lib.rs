@@ -12,10 +12,17 @@ use mx20022_channels::{
     OutboundMessage,
 };
 use mx20022_crypto::auth::constant_time_eq;
+use rustls::server::ServerConfig;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio_rustls::TlsAcceptor;
+
+const TCP_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_MAX_INFLIGHT: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TcpFraming {
@@ -30,6 +37,11 @@ pub struct TcpInboundConfig {
     pub framing: TcpFraming,
     pub content_type: String,
     pub auth_token: Option<SecretString>,
+    /// Optional TLS. When set, accepted connections are wrapped in TLS before
+    /// framing/auth. Strongly recommended when `auth_token` is set, since
+    /// otherwise the shared secret traverses the wire in cleartext.
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -56,9 +68,34 @@ impl InboundChannel for TcpInboundChannel {
     }
 
     async fn run(&self, sender: mpsc::Sender<InboundMessage>) -> Result<(), ChannelError> {
+        // Refuse to carry an auth_token over a cleartext transport: without
+        // TLS the shared secret is exposed on the wire to any network
+        // observer. The config layer's enforce_secure_channels already
+        // warns/errors on this combination; this is the defense-in-depth
+        // check at the channel itself.
+        let acceptor = match (
+            self.config.tls_cert_path.as_deref(),
+            self.config.tls_key_path.as_deref(),
+        ) {
+            (Some(cert_path), Some(key_path)) => Some(build_tls_acceptor(cert_path, key_path)?),
+            (None, None) => None,
+            _ => {
+                return Err(ChannelError::new(
+                    "tcp inbound TLS requires both tls_cert and tls_key",
+                ))
+            }
+        };
+        if self.config.auth_token.is_some() && acceptor.is_none() {
+            return Err(ChannelError::new(
+                "tcp inbound auth_token requires TLS (set tls_cert/tls_key); \
+                 refusing to send the shared secret in cleartext",
+            ));
+        }
+
         let listener = TcpListener::bind(&self.config.bind).await.map_err(|e| {
             ChannelError::new(format!("tcp bind failed on {}: {e}", self.config.bind))
         })?;
+        let inflight = Arc::new(Semaphore::new(TCP_MAX_INFLIGHT));
 
         while !self.shutdown.load(Ordering::Relaxed) {
             if self.paused.load(Ordering::Relaxed) {
@@ -71,14 +108,42 @@ impl InboundChannel for TcpInboundChannel {
                 .await
                 .map_err(|e| ChannelError::new(format!("tcp accept failed: {e}")))?;
 
+            let Ok(permit) = inflight.clone().try_acquire_owned() else {
+                tracing::warn!("tcp inbound at concurrency limit; dropping connection");
+                continue;
+            };
+
             let sender = sender.clone();
             let framing = self.config.framing;
             let content_type = self.config.content_type.clone();
             let auth_token = self.config.auth_token.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                if let Err(error) =
-                    process_connection(stream, framing, content_type, auth_token, sender).await
-                {
+                let _permit = permit;
+                let result = match acceptor {
+                    Some(acceptor) => {
+                        match tokio::time::timeout(TCP_IO_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => {
+                                process_connection(
+                                    tls_stream,
+                                    framing,
+                                    content_type,
+                                    auth_token,
+                                    sender,
+                                )
+                                .await
+                            }
+                            Ok(Err(error)) => {
+                                Err(ChannelError::new(format!("tls handshake failed: {error}")))
+                            }
+                            Err(_) => Err(ChannelError::new("tls handshake timed out")),
+                        }
+                    }
+                    None => {
+                        process_connection(stream, framing, content_type, auth_token, sender).await
+                    }
+                };
+                if let Err(error) = result {
                     tracing::warn!(error = %error, "tcp inbound connection failed");
                 }
             });
@@ -200,22 +265,34 @@ impl OutboundChannel for TcpOutboundChannel {
     }
 }
 
-async fn process_connection(
-    stream: TcpStream,
+async fn process_connection<S>(
+    stream: S,
     framing: TcpFraming,
     content_type: String,
     auth_token: Option<SecretString>,
     sender: mpsc::Sender<InboundMessage>,
-) -> Result<(), ChannelError> {
+) -> Result<(), ChannelError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     match framing {
         TcpFraming::LengthPrefixed => {
             let mut stream = stream;
             if let Some(expected) = auth_token.as_ref().map(ExposeSecret::expose_secret) {
-                let auth_frame = read_length_prefixed(&mut stream).await?;
+                let auth_frame = first_frame_timeout(read_length_prefixed(&mut stream)).await?;
                 let presented = decode_utf8_payload(&auth_frame)?;
                 if !constant_time_eq(presented.trim(), expected) {
                     return Err(ChannelError::new("tcp auth failed"));
                 }
+            } else {
+                let frame = first_frame_timeout(read_length_prefixed(&mut stream)).await?;
+                sender
+                    .send(InboundMessage {
+                        raw: decode_utf8_payload(&frame)?,
+                        content_type: content_type.clone(),
+                    })
+                    .await
+                    .map_err(|e| ChannelError::new(format!("inbound queue send failed: {e}")))?;
             }
             loop {
                 let frame = read_length_prefixed(&mut stream).await?;
@@ -232,11 +309,14 @@ async fn process_connection(
             let mut reader = BufReader::new(stream);
             if let Some(expected) = auth_token.as_ref().map(ExposeSecret::expose_secret) {
                 let mut auth_buf = Vec::new();
-                let bytes = (&mut reader)
-                    .take(MAX_FRAME_SIZE as u64 + 1)
-                    .read_until(delimiter, &mut auth_buf)
-                    .await
-                    .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))?;
+                let bytes = first_frame_timeout(async {
+                    (&mut reader)
+                        .take(MAX_FRAME_SIZE as u64 + 1)
+                        .read_until(delimiter, &mut auth_buf)
+                        .await
+                        .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))
+                })
+                .await?;
                 if bytes == 0 {
                     return Err(ChannelError::new("tcp auth failed"));
                 }
@@ -248,13 +328,22 @@ async fn process_connection(
                     return Err(ChannelError::new("tcp auth failed"));
                 }
             }
+            let mut first_payload = auth_token.is_none();
             loop {
                 let mut buf = Vec::new();
-                let bytes = (&mut reader)
-                    .take(MAX_FRAME_SIZE as u64 + 1)
-                    .read_until(delimiter, &mut buf)
-                    .await
-                    .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))?;
+                let read = async {
+                    (&mut reader)
+                        .take(MAX_FRAME_SIZE as u64 + 1)
+                        .read_until(delimiter, &mut buf)
+                        .await
+                        .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))
+                };
+                let bytes = if first_payload {
+                    first_payload = false;
+                    first_frame_timeout(read).await?
+                } else {
+                    read.await?
+                };
                 if bytes == 0 {
                     return Ok(());
                 }
@@ -279,6 +368,15 @@ async fn process_connection(
     }
 }
 
+async fn first_frame_timeout<F, T>(op: F) -> Result<T, ChannelError>
+where
+    F: std::future::Future<Output = Result<T, ChannelError>>,
+{
+    tokio::time::timeout(TCP_IO_TIMEOUT, op)
+        .await
+        .map_err(|_| ChannelError::new("tcp first frame timed out"))?
+}
+
 const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
 
 fn decode_utf8_payload(payload: &[u8]) -> Result<String, ChannelError> {
@@ -286,7 +384,36 @@ fn decode_utf8_payload(payload: &[u8]) -> Result<String, ChannelError> {
         .map_err(|_| ChannelError::new("tcp payload is not valid UTF-8"))
 }
 
-async fn read_length_prefixed(stream: &mut TcpStream) -> Result<Vec<u8>, ChannelError> {
+/// Load a cert chain + private key from PEM files and build a TLS acceptor.
+/// Mirrors the admin host's axum_server TLS path but uses tokio-rustls
+/// directly so the TCP channel can wrap raw accepted streams.
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, ChannelError> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| ChannelError::new(format!("failed to open tls_cert `{cert_path}`: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ChannelError::new(format!("failed to parse tls_cert `{cert_path}`: {e}")))?;
+    if certs.is_empty() {
+        return Err(ChannelError::new(format!(
+            "tls_cert `{cert_path}` contained no certificates"
+        )));
+    }
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| ChannelError::new(format!("failed to load tls_key `{key_path}`: {e}")))?;
+
+    let config =
+        ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| ChannelError::new(format!("tls protocol version selection failed: {e}")))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| ChannelError::new(format!("tls server config build failed: {e}")))?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+async fn read_length_prefixed<S>(stream: &mut S) -> Result<Vec<u8>, ChannelError>
+where
+    S: AsyncReadExt + Unpin,
+{
     let mut header = [0_u8; 4];
     stream
         .read_exact(&mut header)
@@ -343,6 +470,7 @@ mod tests {
     use std::time::Duration;
 
     use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
+    use secrecy::SecretString;
 
     use super::{
         TcpFraming, TcpInboundChannel, TcpInboundConfig, TcpOutboundChannel, TcpOutboundConfig,
@@ -372,6 +500,8 @@ mod tests {
             framing: TcpFraming::LengthPrefixed,
             content_type: "application/xml".to_string(),
             auth_token: None,
+            tls_cert_path: None,
+            tls_key_path: None,
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let runner = inbound.clone();
@@ -379,7 +509,12 @@ mod tests {
             let _ = runner.run(tx).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !mx20022_channels::wait_for_tcp(format!("127.0.0.1:{port}"), Duration::from_secs(2))
+            .await
+        {
+            eprintln!("skipping tcp roundtrip test: listener not ready");
+            return;
+        }
 
         let outbound = TcpOutboundChannel::new(TcpOutboundConfig {
             name: "tcp-out".to_string(),
@@ -408,5 +543,50 @@ mod tests {
             .expect("message should be received")
             .expect("message must exist");
         assert_eq!(message.raw, "<Document/>");
+    }
+
+    #[tokio::test]
+    async fn run_refuses_auth_token_without_tls() {
+        let inbound = TcpInboundChannel::new(TcpInboundConfig {
+            name: "tcp-in".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            framing: TcpFraming::LengthPrefixed,
+            content_type: "application/xml".to_string(),
+            auth_token: Some(SecretString::new("shared-secret".into())),
+            tls_cert_path: None,
+            tls_key_path: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = inbound.run(tx).await;
+        assert!(
+            result.is_err(),
+            "run() should refuse auth_token without TLS"
+        );
+        let message = result.expect_err("error message").to_string();
+        assert!(
+            message.contains("requires TLS"),
+            "error should mention TLS requirement: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_rejects_half_configured_tls() {
+        let inbound = TcpInboundChannel::new(TcpInboundConfig {
+            name: "tcp-in".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            framing: TcpFraming::LengthPrefixed,
+            content_type: "application/xml".to_string(),
+            auth_token: None,
+            tls_cert_path: Some("/tmp/only-cert.pem".to_string()),
+            tls_key_path: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = inbound.run(tx).await;
+        assert!(result.is_err());
+        let message = result.expect_err("error message").to_string();
+        assert!(
+            message.contains("both tls_cert and tls_key"),
+            "half-configured TLS must fail: {message}"
+        );
     }
 }

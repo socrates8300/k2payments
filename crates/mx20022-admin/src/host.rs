@@ -59,17 +59,7 @@ pub async fn serve_with_tls_and_cors(
         rate_limiter: Arc::new(AdminRateLimiter::default()),
     };
 
-    let router = Router::new()
-        .route("/health", get(get_health))
-        .route("/ready", get(get_ready))
-        .route("/status", get(get_status))
-        .route("/reload", post(reload_config))
-        .route("/tx/:tx_id", get(get_tx))
-        .route("/metrics", get(get_metrics))
-        .layer(build_cors_layer(&allowed_origins))
-        .layer(map_response(add_security_headers))
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES))
-        .with_state(state);
+    let router = admin_router(state).layer(build_cors_layer(&allowed_origins));
 
     if let Some(tls) = tls {
         let config =
@@ -97,6 +87,19 @@ pub async fn serve_with_tls_and_cors(
             .await
             .map_err(|e| HostError::Serve(e.to_string()))
     }
+}
+
+fn admin_router(state: HostState) -> Router {
+    Router::new()
+        .route("/health", get(get_health))
+        .route("/ready", get(get_ready))
+        .route("/status", get(get_status))
+        .route("/reload", post(reload_config))
+        .route("/tx/:tx_id", get(get_tx))
+        .route("/metrics", get(get_metrics))
+        .layer(map_response(add_security_headers))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES))
+        .with_state(state)
 }
 
 fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
@@ -138,12 +141,20 @@ async fn add_security_headers(mut response: axum::response::Response) -> axum::r
     response
 }
 
-async fn get_metrics() -> impl IntoResponse {
-    (
+async fn get_metrics(
+    State(state): State<HostState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // /metrics exposes operational data (counts, latencies, pipeline health)
+    // and must not be served unauthenticated. Gated at Status (read) level,
+    // matching /status.
+    authorize(&state, &headers, AdminResource::Status)?;
+
+    Ok((
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
         mx20022_metrics::gather(),
-    )
+    ))
 }
 
 async fn get_health(
@@ -331,4 +342,89 @@ pub enum HostError {
     Serve(String),
     #[error("TLS configuration error: {0}")]
     Tls(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use mx20022_store::Store;
+    use mx20022_store_sqlite::SqliteStore;
+    use secrecy::SecretString;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    use super::{admin_router, HostState};
+    use crate::auth::{AuthConfig, AuthMode};
+    use crate::rate_limit::AdminRateLimiter;
+    use crate::service::{ReloadStatus, RuntimeStatusSnapshot, StoreBackedAdminController};
+
+    async fn test_state(auth: AuthConfig) -> HostState {
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
+        let controller = StoreBackedAdminController::new(
+            store,
+            RuntimeStatusSnapshot {
+                runtime: "test-runtime".to_string(),
+                pipelines: vec!["demo".to_string()],
+                channels: vec!["http".to_string()],
+                store: "sqlite".to_string(),
+                started_at: SystemTime::now(),
+                reload_status: Arc::new(RwLock::new(ReloadStatus {
+                    config_version: "cfg-v1".to_string(),
+                    last_result: None,
+                    last_reloaded_at: None,
+                })),
+            },
+        );
+        HostState {
+            controller: Arc::new(controller),
+            auth,
+            rate_limiter: Arc::new(AdminRateLimiter::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_requires_status_auth_on_live_host() {
+        let auth = AuthConfig {
+            mode: AuthMode::LegacyBearer,
+            legacy_bearer_token: Some(SecretString::new("admin-token".into())),
+            ..AuthConfig::default()
+        };
+        let app = admin_router(test_state(auth).await);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4")
+        );
+    }
 }

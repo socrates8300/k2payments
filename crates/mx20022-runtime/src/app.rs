@@ -49,7 +49,7 @@ use mx20022_participants::status_response_builder::StatusResponseBuilder;
 use mx20022_runtime_core::context::{Context, ContextMeta};
 use mx20022_runtime_core::participant::Participant;
 use mx20022_runtime_core::transaction_manager::{TransactionManager, TransactionReport};
-use mx20022_store::{Store, StoreQuery};
+use mx20022_store::{DeadLetter, Store, StoreQuery};
 #[cfg(feature = "store-postgres")]
 use mx20022_store_postgres::PostgresStore;
 #[cfg(feature = "store-rocksdb")]
@@ -93,6 +93,11 @@ pub struct RecoveryReport {
     pub attempted: usize,
     pub recovered: usize,
     pub failed: usize,
+    /// Transactions that failed recovery and were moved to the dead-letter
+    /// store + marked Poison so they exit the recovery set on the next
+    /// restart. Without this, a perpetually-failing tx replays on every
+    /// startup forever.
+    pub dead_lettered: usize,
 }
 
 struct PipelineRuntime {
@@ -480,6 +485,9 @@ impl RuntimeApp {
                 let tx_id = record.tx_id.clone();
                 let pipeline = record.pipeline.clone();
                 let state = record.state.clone();
+                // Clone raw_message up front; process() takes it by value and
+                // we need it again to save a dead letter if recovery fails.
+                let raw_message = record.raw_message.clone();
                 let recovery = self
                     .process(
                         &pipeline,
@@ -494,19 +502,88 @@ impl RuntimeApp {
                     Ok(_) => report.recovered += 1,
                     Err(error) => {
                         report.failed += 1;
-                        tracing::error!(
-                            tx_id = %tx_id,
-                            pipeline = %pipeline,
-                            state = %state,
-                            error = %error,
-                            "startup recovery replay failed"
-                        );
+                        if self
+                            .maybe_quarantine_failed_recovery(&tx_id, &state, &raw_message, &error)
+                            .await
+                        {
+                            report.dead_lettered += 1;
+                        }
                     }
                 }
             }
         }
 
         Ok(report)
+    }
+
+    async fn maybe_quarantine_failed_recovery(
+        &self,
+        tx_id: &str,
+        prior_state: &str,
+        raw_message: &str,
+        error: &RuntimeBuildError,
+    ) -> bool {
+        let current_state = match self.store.find_by_id(tx_id).await {
+            Ok(Some(record)) => record.state,
+            Ok(None) => prior_state.to_string(),
+            Err(store_err) => {
+                tracing::error!(
+                    tx_id = %tx_id,
+                    error = %store_err,
+                    "recovery failed and the row could not be re-read; leaving for retry"
+                );
+                return false;
+            }
+        };
+
+        if !recovery_should_quarantine(&current_state, error) {
+            tracing::error!(
+                tx_id = %tx_id,
+                state = %current_state,
+                error = %error,
+                "recovery replay failed; leaving transaction in place"
+            );
+            return false;
+        }
+
+        tracing::error!(
+            tx_id = %tx_id,
+            state = %current_state,
+            error = %error,
+            "startup recovery replay failed permanently; dead-lettering transaction"
+        );
+
+        if let Err(dl_error) = self
+            .store
+            .save_dead_letter(&DeadLetter {
+                id: format!("DL-{tx_id}"),
+                tx_id: tx_id.to_string(),
+                reason: format!("recovery failed: {error}"),
+                failed_at: std::time::SystemTime::now(),
+                raw_message: raw_message.to_string(),
+            })
+            .await
+        {
+            tracing::error!(
+                tx_id = %tx_id,
+                error = %dl_error,
+                "failed to save dead letter during recovery; transaction will replay on next restart"
+            );
+            return false;
+        }
+        if let Err(c_error) = self
+            .store
+            .complete_transaction(tx_id, mx20022_store::Outcome::Poison)
+            .await
+        {
+            tracing::error!(
+                tx_id = %tx_id,
+                error = %c_error,
+                "failed to mark transaction Poison after dead-letter; transaction will replay on next restart"
+            );
+            return false;
+        }
+        true
     }
 
     pub async fn reload_participant_configs(
@@ -1050,6 +1127,27 @@ fn read_f64(cfg: &ParticipantConfig, key: &str) -> Option<f64> {
         })
 }
 
+const RECOVERY_STATES: &[&str] = &[
+    "RECEIVED",
+    "PREPARING",
+    "PREPARED",
+    "COMMITTING",
+    "ABORTING",
+];
+
+fn recovery_error_is_permanent(error: &RuntimeBuildError) -> bool {
+    matches!(
+        error,
+        RuntimeBuildError::UnknownPipeline(_)
+            | RuntimeBuildError::UnknownParticipant(_)
+            | RuntimeBuildError::MessageTypeNotAccepted { .. }
+    )
+}
+
+fn recovery_should_quarantine(current_state: &str, error: &RuntimeBuildError) -> bool {
+    RECOVERY_STATES.contains(&current_state) && recovery_error_is_permanent(error)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeBuildError {
     #[error("unknown participant `{0}`")]
@@ -1266,7 +1364,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"
@@ -1316,7 +1414,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "duplicate-guard"
@@ -1340,7 +1438,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [channels.http-out]
 type = "http"
@@ -1427,7 +1525,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "recovery"
@@ -1477,6 +1575,127 @@ participants = [
         assert_eq!(updated.state, "COMMITTED");
     }
 
+    #[tokio::test]
+    async fn recovery_dead_letters_transactions_that_fail_replay() {
+        // Permanent recovery failures (unknown pipeline) must leave the
+        // recovery query set via dead-letter + Poison.
+        let config = RuntimeConfig::parse(RECOVERY_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let store: Arc<dyn Store> = app.store_handle();
+        // Seed a tx whose pipeline does not exist in the config, so process()
+        // returns UnknownPipeline and recovery fails deterministically.
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-REC-FAIL".to_string(),
+                pipeline: "nonexistent-pipeline".to_string(),
+                source_channel: "http-in".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "PREPARING".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: None,
+                key_fields: HashMap::new(),
+            })
+            .await
+            .expect("seed tx should succeed");
+
+        let report = app
+            .recover_incomplete_transactions(10)
+            .await
+            .expect("recovery should run");
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.recovered, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.dead_lettered, 1);
+
+        // The failed tx is now Poison (outside the recovery query states),
+        // so a second recovery pass does not replay it.
+        let second = app
+            .recover_incomplete_transactions(10)
+            .await
+            .expect("recovery should run");
+        assert_eq!(second.attempted, 0, "failed tx should not replay");
+
+        let updated = store
+            .find_by_id("TX-REC-FAIL")
+            .await
+            .expect("lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(updated.state, "POISON");
+
+        // The raw message is preserved in the dead-letter store for operator
+        // replay once the root cause is fixed.
+        use mx20022_store::DeadLetterQuery;
+        let letters = store
+            .list_dead_letters(DeadLetterQuery {
+                pipeline: None,
+                limit: Some(10),
+            })
+            .await
+            .expect("list dead letters");
+        assert_eq!(letters.len(), 1);
+        assert_eq!(letters[0].tx_id, "TX-REC-FAIL");
+        assert_eq!(letters[0].raw_message, "<Document/>");
+    }
+
+    #[test]
+    fn recovery_quarantine_skips_terminal_and_retryable_errors() {
+        use super::{recovery_should_quarantine, RuntimeBuildError};
+
+        let permanent = RuntimeBuildError::UnknownPipeline("missing".to_string());
+        let retryable = RuntimeBuildError::Outbound("downstream down".to_string());
+
+        assert!(recovery_should_quarantine("PREPARING", &permanent));
+        assert!(!recovery_should_quarantine("COMMITTED", &permanent));
+        assert!(!recovery_should_quarantine("POISON", &permanent));
+        assert!(!recovery_should_quarantine("PREPARING", &retryable));
+        assert!(!recovery_should_quarantine("COMMITTING", &retryable));
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_poison_already_committed_row() {
+        let config = RuntimeConfig::parse(RECOVERY_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let store: Arc<dyn Store> = app.store_handle();
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-REC-COMMITTED".to_string(),
+                pipeline: "recovery".to_string(),
+                source_channel: "http-in".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "COMMITTED".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: None,
+                key_fields: HashMap::new(),
+            })
+            .await
+            .expect("seed tx should succeed");
+
+        let quarantined = app
+            .maybe_quarantine_failed_recovery(
+                "TX-REC-COMMITTED",
+                "PREPARING",
+                "<Document/>",
+                &RuntimeBuildError::UnknownPipeline("missing".to_string()),
+            )
+            .await;
+        assert!(!quarantined);
+
+        let updated = store
+            .find_by_id("TX-REC-COMMITTED")
+            .await
+            .expect("lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(updated.state, "COMMITTED");
+    }
+
     const RELOAD_CONFIG_BASE: &str = r#"
 [runtime]
 name = "test-runtime"
@@ -1489,7 +1708,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "reloadable"
@@ -1513,7 +1732,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "reloadable"
@@ -1537,7 +1756,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "reloadable"
@@ -1598,7 +1817,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "timeout-pipeline"
@@ -1654,7 +1873,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "correlation-match"
@@ -1720,7 +1939,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "correlation-register"
@@ -1781,7 +2000,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "test-pipeline"
@@ -2028,7 +2247,7 @@ url = "mongodb://localhost:27017/test"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"
@@ -2064,7 +2283,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "bad-outbound"
@@ -2114,7 +2333,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"

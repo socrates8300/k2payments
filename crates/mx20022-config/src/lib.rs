@@ -121,6 +121,19 @@ impl RuntimeConfig {
                             .to_string(),
                     ));
                 }
+                for (name, roles) in [
+                    ("ready_roles", &auth.ready_roles),
+                    ("status_roles", &auth.status_roles),
+                    ("tx_roles", &auth.tx_roles),
+                    ("reload_roles", &auth.reload_roles),
+                ] {
+                    if roles.iter().all(|role| role.trim().is_empty()) {
+                        return Err(ConfigError::Validation(format!(
+                            "runtime.admin_auth.{name} must be non-empty when mode=jwt_hs256 \
+                             (without it, any signed token is authorized for that resource)"
+                        )));
+                    }
+                }
             }
             other => {
                 return Err(ConfigError::Validation(format!(
@@ -226,6 +239,11 @@ pub struct RuntimeSection {
     pub admin_grpc_bind: Option<String>,
     #[serde(default)]
     pub admin_cors_allowed_origins: Vec<String>,
+    /// Explicit operator acknowledgement that the admin service may bind a
+    /// non-loopback address with authentication disabled. Required to start
+    /// in that configuration; otherwise startup is refused.
+    #[serde(default)]
+    pub admin_allow_insecure_bind: bool,
     #[serde(default)]
     pub enforce_secure_channels: bool,
     #[serde(default)]
@@ -251,6 +269,23 @@ fn validate_channel_security(
 ) -> Result<(), ConfigError> {
     if channel.channel_type == "file" {
         return Ok(());
+    }
+    let tls_enabled = channel
+        .extra
+        .get("tls_enabled")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let has_tls_pair = matches!(
+        (
+            channel.extra.get("tls_cert").and_then(toml::Value::as_str),
+            channel.extra.get("tls_key").and_then(toml::Value::as_str),
+        ),
+        (Some(_), Some(_))
+    );
+    if tls_enabled && !has_tls_pair {
+        return Err(ConfigError::Validation(format!(
+            "channel `{channel_name}` has tls_enabled=true but tls_cert/tls_key are not both set"
+        )));
     }
     let allow_plaintext = channel
         .extra
@@ -302,13 +337,8 @@ fn is_channel_secure(channel: &ChannelSection) -> bool {
         .and_then(toml::Value::as_str)
         .map(|value| matches!(value.to_ascii_uppercase().as_str(), "SSL" | "SASL_SSL"))
         .unwrap_or(false);
-    let tcp_tls_enabled = channel
-        .extra
-        .get("tls_enabled")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
 
-    has_server_tls || uses_secure_url || kafka_secure || tcp_tls_enabled
+    has_server_tls || uses_secure_url || kafka_secure
 }
 
 fn default_log_level() -> String {
@@ -500,7 +530,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"
@@ -530,6 +560,24 @@ mode = "jwt_hs256"
         );
         let result = RuntimeConfig::parse(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_jwt_mode_with_empty_role_list() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "secret"
+ready_roles = []
+"#
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .expect_err("empty ready_roles must fail")
+            .to_string()
+            .contains("ready_roles"));
     }
 
     #[test]
@@ -883,6 +931,37 @@ jwt_hs256_secret = "secret://{}"
     }
 
     #[test]
+    fn rejects_tls_enabled_without_cert_key_pair() {
+        let config = r#"
+[runtime]
+name = "runtime"
+instance_id = "local"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.tcp-in]
+type = "tcp"
+mode = "server"
+bind = "127.0.0.1:7001"
+tls_enabled = true
+allow_plaintext = true
+
+[[pipeline]]
+name = "demo"
+channel_in = "tcp-in"
+participants = [{ name = "message-logger" }]
+"#;
+        let result = RuntimeConfig::parse(config);
+        assert!(result.is_err());
+        assert!(result
+            .expect_err("tls_enabled without cert/key must fail")
+            .to_string()
+            .contains("tls_enabled=true"));
+    }
+
+    #[test]
     fn rejects_plaintext_channel_when_secure_channels_enforced() {
         let config = BASE_CONFIG.replace(
             r#"instance_id = "local""#,
@@ -912,7 +991,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 allow_plaintext = true
 
 [[pipeline]]

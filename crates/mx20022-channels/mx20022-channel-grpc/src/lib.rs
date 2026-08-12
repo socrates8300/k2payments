@@ -351,7 +351,10 @@ mod tests {
             let _ = runner.run_with_listener(listener, tx).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            mx20022_channels::wait_for_tcp(local_addr.to_string(), Duration::from_secs(2)).await,
+            "grpc inbound should become ready within 2s"
+        );
 
         let outbound = GrpcOutboundChannel::new(GrpcOutboundConfig {
             name: "grpc-out".to_string(),

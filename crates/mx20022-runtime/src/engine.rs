@@ -98,6 +98,8 @@ pub async fn run_pipelines(
                         .unwrap_or_else(|| "application/xml".to_string()),
                     auth_token: extract_optional(channel_cfg, "auth_token")
                         .map(|value| SecretString::new(value.into_boxed_str())),
+                    tls_cert_path: extract_optional(channel_cfg, "tls_cert"),
+                    tls_key_path: extract_optional(channel_cfg, "tls_key"),
                 })),
                 #[cfg(feature = "channel-nats")]
                 ("nats", "subscriber") => Arc::new(NatsInboundChannel::new(NatsInboundConfig {
@@ -174,6 +176,14 @@ pub async fn run_pipelines(
         let tx_id_prefix = tx_id_prefix.clone();
         tasks.spawn(async move {
             let semaphore = Arc::new(Semaphore::new(max_concurrent));
+            // Per-message tasks live in this inner JoinSet instead of being
+            // detached via tokio::spawn. That way, when the outer receiver
+            // loop exits (inbound channel closed on shutdown), we drain the
+            // in-flight transactions here before returning. Because this task
+            // is itself in the outer `tasks` JoinSet, the engine's shutdown
+            // drain now actually waits for in-flight transactions to complete
+            // (or time out) rather than orphaning them mid-flight.
+            let mut message_tasks: JoinSet<()> = JoinSet::new();
 
             while let Some(msg) = rx.recv().await {
                 let permit = semaphore
@@ -189,7 +199,7 @@ pub async fn run_pipelines(
                 let raw = msg.raw;
                 let tx_id_prefix = tx_id_prefix.clone();
 
-                tokio::spawn(async move {
+                message_tasks.spawn(async move {
                     let _permit = permit;
                     let tx_id = next_tx_id(&tx_id_prefix);
 
@@ -205,6 +215,21 @@ pub async fn run_pipelines(
                         );
                     }
                 });
+            }
+
+            // Inbound channel closed (shutdown). Drain in-flight transactions.
+            // A panic in a message task surfaces as a JoinError here; we log
+            // and continue draining the rest rather than aborting the whole
+            // pipeline, so one bad message doesn't prevent the others from
+            // completing during shutdown.
+            while let Some(res) = message_tasks.join_next().await {
+                if let Err(error) = res {
+                    if error.is_panic() {
+                        tracing::error!(error = %error, "message task panicked during drain");
+                    } else {
+                        tracing::warn!(error = %error, "message task cancelled during drain");
+                    }
+                }
             }
 
             Ok(())
@@ -514,18 +539,27 @@ fn extract_inbound_auth(channel_cfg: &ChannelSection) -> Result<InboundAuthConfi
             }
         }
         InboundAuthMode::JwtHs256 => {
-            if auth
+            if !auth
                 .jwt_hs256_secret
                 .as_ref()
                 .map(|value| !value.expose_secret().trim().is_empty())
                 .unwrap_or(false)
             {
-                Ok(auth)
-            } else {
-                Err(EngineError::Config(
+                return Err(EngineError::Config(
                     "channel auth_mode=jwt_hs256 requires auth_jwt_hs256_secret".to_string(),
-                ))
+                ));
             }
+            // Require explicit role gating: without required_roles, any token
+            // signed with the secret is fully authorized to ingest messages,
+            // which is almost never the intended deployment posture.
+            if auth.required_roles.is_empty() {
+                return Err(EngineError::Config(
+                    "channel auth_mode=jwt_hs256 requires auth_required_roles \
+                     (without it, any signed token is fully authorized)"
+                        .to_string(),
+                ));
+            }
+            Ok(auth)
         }
     }
 }
@@ -635,7 +669,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 {extra_lines}
 
 [[pipeline]]
@@ -675,6 +709,41 @@ auth_bearer_token = "secret"
                 .map(|value| value.expose_secret())
                 == Some("secret")
         );
+    }
+
+    #[cfg(any(feature = "channel-http", feature = "channel-grpc"))]
+    #[test]
+    fn extract_inbound_auth_rejects_jwt_without_required_roles() {
+        // Without required_roles any token signed with the secret is fully
+        // authorized to ingest messages. Reject the config so operators must
+        // declare an explicit role gate.
+        let cfg = channel_config_block(
+            r#"
+auth_mode = "jwt_hs256"
+auth_jwt_hs256_secret = "shared-secret"
+"#,
+        );
+        let channel = cfg.channels.get("http-in").expect("channel should exist");
+        let err = extract_inbound_auth(channel).expect_err("config should be rejected");
+        assert!(
+            matches!(err, EngineError::Config(ref message) if message.contains("auth_required_roles")),
+            "expected required_roles rejection, got: {err:?}"
+        );
+    }
+
+    #[cfg(any(feature = "channel-http", feature = "channel-grpc"))]
+    #[test]
+    fn extract_inbound_auth_accepts_jwt_with_required_roles() {
+        let cfg = channel_config_block(
+            r#"
+auth_mode = "jwt_hs256"
+auth_jwt_hs256_secret = "shared-secret"
+auth_required_roles = ["channel.ingest"]
+"#,
+        );
+        let channel = cfg.channels.get("http-in").expect("channel should exist");
+        let auth = extract_inbound_auth(channel).expect("auth should parse");
+        assert_eq!(auth.required_roles, vec!["channel.ingest".to_string()]);
     }
 
     #[cfg(feature = "channel-http")]
@@ -816,5 +885,111 @@ participants = [{{ name = "message-logger" }}]
         );
         // Direct call — must complete cleanly.
         app.shutdown_outbound_channels().await;
+    }
+
+    /// JoinSet so shutdown can drain in-flight process() tasks.
+    #[cfg(feature = "channel-http")]
+    #[tokio::test]
+    async fn run_pipelines_drains_and_returns_ok_after_message_then_shutdown() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use super::run_pipelines;
+        use crate::app::RuntimeApp;
+        use tokio::sync::oneshot;
+
+        let port = pick_free_port();
+        let config = runnable_config(port);
+        let app = Arc::new(
+            RuntimeApp::from_config(&config)
+                .await
+                .expect("app should build"),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let engine_handle = tokio::spawn(run_pipelines(Arc::clone(&app), config, async move {
+            // The engine polls this; resolving it triggers drain.
+            let _ = shutdown_rx.await;
+        }));
+
+        // Wait for the inbound HTTP server to accept connections, then POST
+        // a pacs.008 payload. The message-logger participant completes the
+        // transaction (no outbound channel in runnable_config, so process()
+        // returns Ok after the participant runs).
+        assert!(
+            mx20022_channels::wait_for_tcp(format!("127.0.0.1:{port}"), Duration::from_secs(2))
+                .await,
+            "inbound http should become ready"
+        );
+
+        // POST a minimal pacs.008 payload via a raw HTTP/1.1 request over a
+        // TCP socket (avoids adding reqwest as a dev-dependency just for this
+        // test). The inbound accepts the body and enqueues it.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = "<?xml version=\"1.0\"?>\
+            <Document xmlns=\"urn:iso:std:iso:20022:tech:xsd:pacs.008.001.13\">\
+            </Document>";
+        let request = format!(
+            "POST / HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/xml\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            len = body.len()
+        );
+        let mut sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect to inbound");
+        sock.write_all(request.as_bytes())
+            .await
+            .expect("write POST");
+        let mut response = Vec::new();
+        sock.read_to_end(&mut response).await.ok();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 202") || response_str.starts_with("HTTP/1.1 200"),
+            "inbound should accept the message (2xx); got: {}",
+            response_str.split("\r\n").next().unwrap_or("?")
+        );
+
+        let _ = shutdown_tx.send(());
+
+        let result = tokio::time::timeout(Duration::from_secs(10), engine_handle)
+            .await
+            .expect("engine should drain and exit within 10s");
+        assert!(
+            result.is_ok(),
+            "run_pipelines should return Ok after drain: {:?}",
+            result.err()
+        );
+
+        let store = app.store_handle();
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let page = store
+                    .query(mx20022_store::StoreQuery {
+                        pipeline: Some("demo".to_string()),
+                        message_type: None,
+                        state: None,
+                        since: None,
+                        until: None,
+                        limit: Some(8),
+                    })
+                    .await
+                    .expect("store query");
+                if let Some(record) = page.records.first() {
+                    return record.state.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("drained transaction must be persisted");
+        assert!(
+            state == "COMMITTED" || state == "POISON",
+            "drain must leave the transaction terminal, got {state}"
+        );
     }
 }
