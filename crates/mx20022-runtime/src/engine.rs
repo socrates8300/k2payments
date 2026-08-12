@@ -98,6 +98,8 @@ pub async fn run_pipelines(
                         .unwrap_or_else(|| "application/xml".to_string()),
                     auth_token: extract_optional(channel_cfg, "auth_token")
                         .map(|value| SecretString::new(value.into_boxed_str())),
+                    tls_cert_path: extract_optional(channel_cfg, "tls_cert"),
+                    tls_key_path: extract_optional(channel_cfg, "tls_key"),
                 })),
                 #[cfg(feature = "channel-nats")]
                 ("nats", "subscriber") => Arc::new(NatsInboundChannel::new(NatsInboundConfig {

@@ -2267,8 +2267,11 @@ dependencies = [
  "async-trait",
  "mx20022-channels",
  "mx20022-crypto",
+ "rustls",
+ "rustls-pki-types",
  "secrecy",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

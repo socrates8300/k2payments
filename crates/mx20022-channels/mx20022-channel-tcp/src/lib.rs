@@ -12,10 +12,14 @@ use mx20022_channels::{
     OutboundMessage,
 };
 use mx20022_crypto::auth::constant_time_eq;
+use rustls::server::ServerConfig;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TcpFraming {
@@ -30,6 +34,11 @@ pub struct TcpInboundConfig {
     pub framing: TcpFraming,
     pub content_type: String,
     pub auth_token: Option<SecretString>,
+    /// Optional TLS. When set, accepted connections are wrapped in TLS before
+    /// framing/auth. Strongly recommended when `auth_token` is set, since
+    /// otherwise the shared secret traverses the wire in cleartext.
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -56,6 +65,33 @@ impl InboundChannel for TcpInboundChannel {
     }
 
     async fn run(&self, sender: mpsc::Sender<InboundMessage>) -> Result<(), ChannelError> {
+        // Refuse to carry an auth_token over a cleartext transport: without
+        // TLS the shared secret is exposed on the wire to any network
+        // observer. The config layer's enforce_secure_channels already
+        // warns/errors on this combination; this is the defense-in-depth
+        // check at the channel itself.
+        let has_tls = self
+            .config
+            .tls_cert_path
+            .as_ref()
+            .zip(self.config.tls_key_path.as_ref())
+            .is_some();
+        if self.config.auth_token.is_some() && !has_tls {
+            return Err(ChannelError::new(
+                "tcp inbound auth_token requires TLS (set tls_cert/tls_key); \
+                 refusing to send the shared secret in cleartext",
+            ));
+        }
+
+        let acceptor = if has_tls {
+            Some(build_tls_acceptor(
+                self.config.tls_cert_path.as_deref().unwrap(),
+                self.config.tls_key_path.as_deref().unwrap(),
+            )?)
+        } else {
+            None
+        };
+
         let listener = TcpListener::bind(&self.config.bind).await.map_err(|e| {
             ChannelError::new(format!("tcp bind failed on {}: {e}", self.config.bind))
         })?;
@@ -75,10 +111,33 @@ impl InboundChannel for TcpInboundChannel {
             let framing = self.config.framing;
             let content_type = self.config.content_type.clone();
             let auth_token = self.config.auth_token.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                if let Err(error) =
-                    process_connection(stream, framing, content_type, auth_token, sender).await
-                {
+                // Handshake first (if TLS), then process. We pass ownership
+                // of the accepted stream into a small async block so the
+                // concrete type is resolved here and process_connection
+                // stays generic over AsyncRead+AsyncWrite.
+                let result = match acceptor {
+                    Some(acceptor) => match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            process_connection(
+                                tls_stream,
+                                framing,
+                                content_type,
+                                auth_token,
+                                sender,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(ChannelError::new(format!(
+                            "tls handshake failed: {error}"
+                        ))),
+                    },
+                    None => {
+                        process_connection(stream, framing, content_type, auth_token, sender).await
+                    }
+                };
+                if let Err(error) = result {
                     tracing::warn!(error = %error, "tcp inbound connection failed");
                 }
             });
@@ -200,13 +259,16 @@ impl OutboundChannel for TcpOutboundChannel {
     }
 }
 
-async fn process_connection(
-    stream: TcpStream,
+async fn process_connection<S>(
+    stream: S,
     framing: TcpFraming,
     content_type: String,
     auth_token: Option<SecretString>,
     sender: mpsc::Sender<InboundMessage>,
-) -> Result<(), ChannelError> {
+) -> Result<(), ChannelError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     match framing {
         TcpFraming::LengthPrefixed => {
             let mut stream = stream;
@@ -286,7 +348,41 @@ fn decode_utf8_payload(payload: &[u8]) -> Result<String, ChannelError> {
         .map_err(|_| ChannelError::new("tcp payload is not valid UTF-8"))
 }
 
-async fn read_length_prefixed(stream: &mut TcpStream) -> Result<Vec<u8>, ChannelError> {
+/// Load a cert chain + private key from PEM files and build a TLS acceptor.
+/// Mirrors the admin host's axum_server TLS path but uses tokio-rustls
+/// directly so the TCP channel can wrap raw accepted streams.
+fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<TlsAcceptor, ChannelError> {
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(cert_path)
+            .map_err(|e| ChannelError::new(format!("failed to open tls_cert `{cert_path}`: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ChannelError::new(format!("failed to parse tls_cert `{cert_path}`: {e}")))?;
+    if certs.is_empty() {
+        return Err(ChannelError::new(format!(
+            "tls_cert `{cert_path}` contained no certificates"
+        )));
+    }
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| ChannelError::new(format!("failed to load tls_key `{key_path}`: {e}")))?;
+
+    let config = ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .map_err(|e| ChannelError::new(format!("tls protocol version selection failed: {e}")))?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| ChannelError::new(format!("tls server config build failed: {e}")))?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+async fn read_length_prefixed<S>(stream: &mut S) -> Result<Vec<u8>, ChannelError>
+where
+    S: AsyncReadExt + Unpin,
+{
     let mut header = [0_u8; 4];
     stream
         .read_exact(&mut header)
@@ -343,6 +439,7 @@ mod tests {
     use std::time::Duration;
 
     use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
+    use secrecy::SecretString;
 
     use super::{
         TcpFraming, TcpInboundChannel, TcpInboundConfig, TcpOutboundChannel, TcpOutboundConfig,
@@ -373,6 +470,8 @@ mod tests {
             framing: TcpFraming::LengthPrefixed,
             content_type: "application/xml".to_string(),
             auth_token: None,
+            tls_cert_path: None,
+            tls_key_path: None,
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let runner = inbound.clone();
@@ -426,5 +525,32 @@ mod tests {
             .expect("message should be received")
             .expect("message must exist");
         assert_eq!(message.raw, "<Document/>");
+    }
+
+    #[tokio::test]
+    async fn run_refuses_auth_token_without_tls() {
+        // Regression: without TLS the shared auth_token traverses the wire in
+        // cleartext. run() must refuse to start in that configuration rather
+        // than silently expose the secret.
+        let inbound = TcpInboundChannel::new(TcpInboundConfig {
+            name: "tcp-in".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            framing: TcpFraming::LengthPrefixed,
+            content_type: "application/xml".to_string(),
+            auth_token: Some(SecretString::new("shared-secret".into())),
+            tls_cert_path: None,
+            tls_key_path: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = inbound.run(tx).await;
+        assert!(
+            result.is_err(),
+            "run() should refuse auth_token without TLS"
+        );
+        let message = result.expect_err("error message").to_string();
+        assert!(
+            message.contains("requires TLS"),
+            "error should mention TLS requirement: {message}"
+        );
     }
 }
