@@ -351,7 +351,19 @@ mod tests {
             let _ = runner.run_with_listener(listener, tx).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Wait for the server to be ready by polling a TCP connect instead
+        // of a fixed sleep, which intermittently raced the tonic serve loop
+        // under CI load.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(local_addr).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("grpc inbound should become ready within 2s");
 
         let outbound = GrpcOutboundChannel::new(GrpcOutboundConfig {
             name: "grpc-out".to_string(),

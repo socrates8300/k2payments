@@ -1266,7 +1266,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"
@@ -1316,7 +1316,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "duplicate-guard"
@@ -1340,7 +1340,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [channels.http-out]
 type = "http"
@@ -1427,7 +1427,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "recovery"
@@ -1489,7 +1489,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "reloadable"
@@ -1513,7 +1513,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "reloadable"
@@ -1537,7 +1537,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "reloadable"
@@ -1598,7 +1598,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "timeout-pipeline"
@@ -1654,7 +1654,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "correlation-match"
@@ -1720,7 +1720,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "correlation-register"
@@ -1781,7 +1781,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "test-pipeline"
@@ -2028,7 +2028,7 @@ url = "mongodb://localhost:27017/test"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"
@@ -2064,7 +2064,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "bad-outbound"
@@ -2114,7 +2114,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"

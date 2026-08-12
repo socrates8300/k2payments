@@ -500,7 +500,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 
 [[pipeline]]
 name = "demo"
@@ -912,7 +912,7 @@ url = "sqlite::memory:"
 [channels.http-in]
 type = "http"
 mode = "server"
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:0"
 allow_plaintext = true
 
 [[pipeline]]

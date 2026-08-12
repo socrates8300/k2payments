@@ -387,8 +387,19 @@ mod tests {
         let run_channel = Arc::clone(&channel);
         let handle = tokio::spawn(async move { run_channel.run(tx).await });
 
-        // Wait for the server to be ready.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the server to be ready by polling a TCP connect instead
+        // of a fixed sleep, which intermittently raced the accept loop under
+        // CI load.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("http inbound should become ready within 2s");
 
         // Send a message before shutdown — should succeed.
         let client = reqwest::Client::new();

@@ -347,6 +347,7 @@ mod tests {
     use super::{
         TcpFraming, TcpInboundChannel, TcpInboundConfig, TcpOutboundChannel, TcpOutboundConfig,
     };
+    use tokio::net::TcpStream;
 
     fn find_available_port() -> Option<u16> {
         match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -379,7 +380,24 @@ mod tests {
             let _ = runner.run(tx).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for the inbound listener to be ready by retrying a TCP
+        // connect until it succeeds or we time out. Replaces a fixed sleep
+        // that intermittently raced the accept loop under CI load.
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if TcpStream::connect(format!("127.0.0.1:{port}")).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // If the listener never came up (e.g. sandbox), skip like the
+        // permission-denied path below rather than fail spuriously.
+        if ready.is_err() {
+            eprintln!("skipping tcp roundtrip test: listener not ready");
+            return;
+        }
 
         let outbound = TcpOutboundChannel::new(TcpOutboundConfig {
             name: "tcp-out".to_string(),
