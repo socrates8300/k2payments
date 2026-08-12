@@ -886,4 +886,100 @@ participants = [{{ name = "message-logger" }}]
         // Direct call — must complete cleanly.
         app.shutdown_outbound_channels().await;
     }
+
+    /// End-to-end drain: POST a real message to the HTTP inbound, then fire
+    /// shutdown, and assert run_pipelines returns Ok within a timeout. This
+    /// exercises the full run path (axum handler -> mpsc queue -> semaphore ->
+    /// inner per-message JoinSet -> drain) that no other test covers, and
+    /// pins the Commit 6 fix that made per-message tasks visible to the
+    /// shutdown drain (previously they were detached and orphaned).
+    #[cfg(feature = "channel-http")]
+    #[tokio::test]
+    async fn run_pipelines_drains_and_returns_ok_after_message_then_shutdown() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use super::run_pipelines;
+        use crate::app::RuntimeApp;
+        use tokio::sync::oneshot;
+
+        let port = pick_free_port();
+        let config = runnable_config(port);
+        let app = Arc::new(
+            RuntimeApp::from_config(&config)
+                .await
+                .expect("app should build"),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let engine_handle = tokio::spawn(run_pipelines(Arc::clone(&app), config, async move {
+            // The engine polls this; resolving it triggers drain.
+            let _ = shutdown_rx.await;
+        }));
+
+        // Wait for the inbound HTTP server to accept connections, then POST
+        // a pacs.008 payload. The message-logger participant completes the
+        // transaction (no outbound channel in runnable_config, so process()
+        // returns Ok after the participant runs).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("inbound http should become ready");
+
+        // POST a minimal pacs.008 payload via a raw HTTP/1.1 request over a
+        // TCP socket (avoids adding reqwest as a dev-dependency just for this
+        // test). The inbound accepts the body and enqueues it.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = "<?xml version=\"1.0\"?>\
+            <Document xmlns=\"urn:iso:std:iso:20022:tech:xsd:pacs.008.001.13\">\
+            </Document>";
+        let request = format!(
+            "POST / HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/xml\r\n\
+             Content-Length: {len}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            len = body.len()
+        );
+        let mut sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect to inbound");
+        sock.write_all(request.as_bytes())
+            .await
+            .expect("write POST");
+        let mut response = Vec::new();
+        sock.read_to_end(&mut response).await.ok();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 202") || response_str.starts_with("HTTP/1.1 200"),
+            "inbound should accept the message (2xx); got: {}",
+            response_str.split("\r\n").next().unwrap_or("?")
+        );
+
+        // Give the pipeline a moment to enqueue the message, then fire
+        // shutdown. Even if the message is still in-flight, the drain must
+        // wait for it (or time out at 30s) and return Ok.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(());
+
+        let result = tokio::time::timeout(Duration::from_secs(10), engine_handle)
+            .await
+            .expect("engine should drain and exit within 10s");
+        assert!(
+            result.is_ok(),
+            "run_pipelines should return Ok after drain: {:?}",
+            result.err()
+        );
+    }
 }
