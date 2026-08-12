@@ -49,7 +49,7 @@ use mx20022_participants::status_response_builder::StatusResponseBuilder;
 use mx20022_runtime_core::context::{Context, ContextMeta};
 use mx20022_runtime_core::participant::Participant;
 use mx20022_runtime_core::transaction_manager::{TransactionManager, TransactionReport};
-use mx20022_store::{Store, StoreQuery};
+use mx20022_store::{DeadLetter, Store, StoreQuery};
 #[cfg(feature = "store-postgres")]
 use mx20022_store_postgres::PostgresStore;
 #[cfg(feature = "store-rocksdb")]
@@ -93,6 +93,11 @@ pub struct RecoveryReport {
     pub attempted: usize,
     pub recovered: usize,
     pub failed: usize,
+    /// Transactions that failed recovery and were moved to the dead-letter
+    /// store + marked Poison so they exit the recovery set on the next
+    /// restart. Without this, a perpetually-failing tx replays on every
+    /// startup forever.
+    pub dead_lettered: usize,
 }
 
 struct PipelineRuntime {
@@ -480,6 +485,9 @@ impl RuntimeApp {
                 let tx_id = record.tx_id.clone();
                 let pipeline = record.pipeline.clone();
                 let state = record.state.clone();
+                // Clone raw_message up front; process() takes it by value and
+                // we need it again to save a dead letter if recovery fails.
+                let raw_message = record.raw_message.clone();
                 let recovery = self
                     .process(
                         &pipeline,
@@ -499,8 +507,45 @@ impl RuntimeApp {
                             pipeline = %pipeline,
                             state = %state,
                             error = %error,
-                            "startup recovery replay failed"
+                            "startup recovery replay failed; dead-lettering transaction"
                         );
+                        // Quarantine the transaction so it does not replay on
+                        // every restart: save the raw message to the
+                        // dead-letter store (operators can replay it via the
+                        // admin replay endpoint once the root cause is fixed)
+                        // and mark the transaction Poison, which is outside
+                        // the recovery query states above.
+                        if let Err(dl_error) = self
+                            .store
+                            .save_dead_letter(&DeadLetter {
+                                id: format!("DL-{tx_id}"),
+                                tx_id: tx_id.clone(),
+                                reason: format!("recovery failed: {error}"),
+                                failed_at: std::time::SystemTime::now(),
+                                raw_message: raw_message.clone(),
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                tx_id = %tx_id,
+                                error = %dl_error,
+                                "failed to save dead letter during recovery; \
+                                 transaction will replay on next restart"
+                            );
+                        } else if let Err(c_error) = self
+                            .store
+                            .complete_transaction(&tx_id, mx20022_store::Outcome::Poison)
+                            .await
+                        {
+                            tracing::error!(
+                                tx_id = %tx_id,
+                                error = %c_error,
+                                "failed to mark transaction Poison after dead-letter; \
+                                 transaction will replay on next restart"
+                            );
+                        } else {
+                            report.dead_lettered += 1;
+                        }
                     }
                 }
             }
@@ -1475,6 +1520,74 @@ participants = [
             .expect("lookup should succeed")
             .expect("record should exist");
         assert_eq!(updated.state, "COMMITTED");
+    }
+
+    #[tokio::test]
+    async fn recovery_dead_letters_transactions_that_fail_replay() {
+        // Regression: a transaction that fails recovery must be moved to the
+        // dead-letter store and marked Poison so it exits the recovery query
+        // set. Without this, a perpetually-failing tx replays on every
+        // restart forever.
+        let config = RuntimeConfig::parse(RECOVERY_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let store: Arc<dyn Store> = app.store_handle();
+        // Seed a tx whose pipeline does not exist in the config, so process()
+        // returns UnknownPipeline and recovery fails deterministically.
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-REC-FAIL".to_string(),
+                pipeline: "nonexistent-pipeline".to_string(),
+                source_channel: "http-in".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "PREPARING".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: None,
+                key_fields: HashMap::new(),
+            })
+            .await
+            .expect("seed tx should succeed");
+
+        let report = app
+            .recover_incomplete_transactions(10)
+            .await
+            .expect("recovery should run");
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.recovered, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.dead_lettered, 1);
+
+        // The failed tx is now Poison (outside the recovery query states),
+        // so a second recovery pass does not replay it.
+        let second = app
+            .recover_incomplete_transactions(10)
+            .await
+            .expect("recovery should run");
+        assert_eq!(second.attempted, 0, "failed tx should not replay");
+
+        let updated = store
+            .find_by_id("TX-REC-FAIL")
+            .await
+            .expect("lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(updated.state, "POISON");
+
+        // The raw message is preserved in the dead-letter store for operator
+        // replay once the root cause is fixed.
+        use mx20022_store::DeadLetterQuery;
+        let letters = store
+            .list_dead_letters(DeadLetterQuery {
+                pipeline: None,
+                limit: Some(10),
+            })
+            .await
+            .expect("list dead letters");
+        assert_eq!(letters.len(), 1);
+        assert_eq!(letters[0].tx_id, "TX-REC-FAIL");
+        assert_eq!(letters[0].raw_message, "<Document/>");
     }
 
     const RELOAD_CONFIG_BASE: &str = r#"

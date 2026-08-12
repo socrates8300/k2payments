@@ -90,6 +90,7 @@ async fn run(
             attempted = recovery.attempted,
             recovered = recovery.recovered,
             failed = recovery.failed,
+            dead_lettered = recovery.dead_lettered,
             limit,
             "startup recovery run completed"
         );
