@@ -226,6 +226,11 @@ pub struct RuntimeSection {
     pub admin_grpc_bind: Option<String>,
     #[serde(default)]
     pub admin_cors_allowed_origins: Vec<String>,
+    /// Explicit operator acknowledgement that the admin service may bind a
+    /// non-loopback address with authentication disabled. Required to start
+    /// in that configuration; otherwise startup is refused.
+    #[serde(default)]
+    pub admin_allow_insecure_bind: bool,
     #[serde(default)]
     pub enforce_secure_channels: bool,
     #[serde(default)]

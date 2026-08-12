@@ -109,10 +109,22 @@ async fn run(
     let admin_tls = build_admin_tls(&config);
     let admin_cors_allowed_origins = config.runtime.admin_cors_allowed_origins.clone();
     let service_mode = (cli.run_pipelines, cli.serve_admin, cli.serve_admin_grpc);
+    // Refuse to start an admin surface on a non-loopback bind with auth
+    // disabled. Without this, a misconfigured deployment would expose
+    // unauthenticated admin endpoints (reload, transaction readout) to the
+    // network. Operators who genuinely want this must set
+    // runtime.admin_allow_insecure_bind=true to acknowledge the risk.
     if matches!(admin_auth.mode, AdminAuthMode::Disabled)
         && (cli.serve_admin || cli.serve_admin_grpc)
+        && !config.runtime.admin_allow_insecure_bind
     {
-        tracing::warn!("admin auth is disabled while admin service is enabled");
+        for bind in [admin_bind.as_str(), admin_grpc_bind.as_str()] {
+            if !is_loopback_bind(bind) {
+                return Err(RuntimeBootstrapError::InsecureAdminBind {
+                    bind: bind.to_string(),
+                });
+            }
+        }
     }
 
     match service_mode {
@@ -352,6 +364,27 @@ fn admin_tls_pair(config: &RuntimeConfig) -> Option<(String, String)> {
     }
 }
 
+/// Returns true if `bind` (a `host:port` or `[ip]:port` string) points at a
+/// loopback address. Conservative: only explicit loopback IP literals
+/// (127.0.0.0/8, ::1) and the `localhost` hostname are treated as loopback;
+/// any other value (including `0.0.0.0`, `::`, or a resolvable hostname) is
+/// treated as non-loopback so that the caller fails closed.
+fn is_loopback_bind(bind: &str) -> bool {
+    // Strip a trailing port. SocketAddr::parse handles bracketed IPv6.
+    let candidate = match bind.rsplit_once(':') {
+        Some((host, _port)) => host,
+        None => bind,
+    };
+    let host = candidate.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // 127.0.0.0/8 is loopback; ::1 is the IPv6 loopback.
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 fn build_admin_auth(config: &RuntimeConfig) -> AdminAuthConfig {
     let mode = match config.runtime.admin_auth.mode.as_str() {
         "disabled" => AdminAuthMode::Disabled,
@@ -525,4 +558,32 @@ enum RuntimeBootstrapError {
     AdminGrpcHost(#[from] mx20022_admin::grpc::GrpcHostError),
     #[error(transparent)]
     Engine(#[from] engine::EngineError),
+    #[error("admin service is bound to non-loopback address `{bind}` with auth disabled; refusing to start. Either bind to 127.0.0.1/localhost, enable runtime.admin_auth.mode (legacy_bearer or jwt_hs256), or set runtime.admin_allow_insecure_bind=true to acknowledge the risk")]
+    InsecureAdminBind { bind: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_bind;
+
+    #[test]
+    fn loopback_detection_for_ipv4() {
+        assert!(is_loopback_bind("127.0.0.1:9090"));
+        assert!(is_loopback_bind("127.1.2.3:9090")); // 127.0.0.0/8 is loopback
+    }
+
+    #[test]
+    fn loopback_detection_for_ipv6_and_localhost() {
+        assert!(is_loopback_bind("[::1]:9090"));
+        assert!(is_loopback_bind("localhost:9090"));
+        assert!(is_loopback_bind("LOCALHOST:9090"));
+    }
+
+    #[test]
+    fn non_loopback_binds_fail_closed() {
+        assert!(!is_loopback_bind("0.0.0.0:9090"));
+        assert!(!is_loopback_bind("[::]:9090"));
+        assert!(!is_loopback_bind("10.0.0.5:9090"));
+        assert!(!is_loopback_bind("admin.internal:9090"));
+    }
 }
