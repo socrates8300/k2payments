@@ -138,12 +138,20 @@ async fn add_security_headers(mut response: axum::response::Response) -> axum::r
     response
 }
 
-async fn get_metrics() -> impl IntoResponse {
-    (
+async fn get_metrics(
+    State(state): State<HostState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // /metrics exposes operational data (counts, latencies, pipeline health)
+    // and must not be served unauthenticated. Gated at Status (read) level,
+    // matching /status.
+    authorize(&state, &headers, AdminResource::Status)?;
+
+    Ok((
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
         mx20022_metrics::gather(),
-    )
+    ))
 }
 
 async fn get_health(

@@ -514,18 +514,27 @@ fn extract_inbound_auth(channel_cfg: &ChannelSection) -> Result<InboundAuthConfi
             }
         }
         InboundAuthMode::JwtHs256 => {
-            if auth
+            if !auth
                 .jwt_hs256_secret
                 .as_ref()
                 .map(|value| !value.expose_secret().trim().is_empty())
                 .unwrap_or(false)
             {
-                Ok(auth)
-            } else {
-                Err(EngineError::Config(
+                return Err(EngineError::Config(
                     "channel auth_mode=jwt_hs256 requires auth_jwt_hs256_secret".to_string(),
-                ))
+                ));
             }
+            // Require explicit role gating: without required_roles, any token
+            // signed with the secret is fully authorized to ingest messages,
+            // which is almost never the intended deployment posture.
+            if auth.required_roles.is_empty() {
+                return Err(EngineError::Config(
+                    "channel auth_mode=jwt_hs256 requires auth_required_roles \
+                     (without it, any signed token is fully authorized)"
+                        .to_string(),
+                ));
+            }
+            Ok(auth)
         }
     }
 }
@@ -675,6 +684,41 @@ auth_bearer_token = "secret"
                 .map(|value| value.expose_secret())
                 == Some("secret")
         );
+    }
+
+    #[cfg(any(feature = "channel-http", feature = "channel-grpc"))]
+    #[test]
+    fn extract_inbound_auth_rejects_jwt_without_required_roles() {
+        // Regression: without required_roles, any token signed with the
+        // secret is fully authorized to ingest messages. Reject the config
+        // so operators must declare an explicit role gate.
+        let cfg = channel_config_block(
+            r#"
+auth_mode = "jwt_hs256"
+auth_jwt_hs256_secret = "shared-secret"
+"#,
+        );
+        let channel = cfg.channels.get("http-in").expect("channel should exist");
+        let err = extract_inbound_auth(channel).expect_err("config should be rejected");
+        assert!(
+            matches!(err, EngineError::Config(ref message) if message.contains("auth_required_roles")),
+            "expected required_roles rejection, got: {err:?}"
+        );
+    }
+
+    #[cfg(any(feature = "channel-http", feature = "channel-grpc"))]
+    #[test]
+    fn extract_inbound_auth_accepts_jwt_with_required_roles() {
+        let cfg = channel_config_block(
+            r#"
+auth_mode = "jwt_hs256"
+auth_jwt_hs256_secret = "shared-secret"
+auth_required_roles = ["channel.ingest"]
+"#,
+        );
+        let channel = cfg.channels.get("http-in").expect("channel should exist");
+        let auth = extract_inbound_auth(channel).expect("auth should parse");
+        assert_eq!(auth.required_roles, vec!["channel.ingest".to_string()]);
     }
 
     #[cfg(feature = "channel-http")]

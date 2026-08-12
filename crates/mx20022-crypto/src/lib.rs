@@ -26,15 +26,29 @@ impl std::fmt::Debug for CryptoService {
 }
 
 impl CryptoService {
+    /// Minimum raw byte length of the master key. HKDF expands this to the
+    /// 32-byte AES-256 key, so a master key shorter than 32 bytes provides
+    /// less than 256 bits of effective key strength. Operators must supply a
+    /// high-entropy secret (e.g. 32+ random bytes, base64-encoded).
+    const MIN_MASTER_KEY_BYTES: usize = 32;
+
     pub fn from_master_key(master_key: &str) -> Result<Self, CryptoError> {
-        if master_key.trim().is_empty() {
+        let trimmed = master_key.trim();
+        if trimmed.is_empty() {
             return Err(CryptoError::InvalidMasterKey(
                 "master key must not be empty".to_string(),
             ));
         }
+        if trimmed.len() < Self::MIN_MASTER_KEY_BYTES {
+            return Err(CryptoError::InvalidMasterKey(format!(
+                "master key must be at least {} bytes (got {}); use a high-entropy secret such as 32+ random bytes",
+                Self::MIN_MASTER_KEY_BYTES,
+                trimmed.len()
+            )));
+        }
 
         // Derive a fixed-length key for AES-256 using HKDF-SHA256 with a domain-separated salt.
-        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), master_key.as_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), trimmed.as_bytes());
         let mut key_bytes = [0_u8; 32];
         hk.expand(b"aes-256-gcm-key", &mut key_bytes)
             .map_err(|e| CryptoError::InvalidMasterKey(format!("HKDF expand failed: {e}")))?;
@@ -121,9 +135,13 @@ pub enum CryptoError {
 mod tests {
     use crate::{CryptoService, EncryptedBlob};
 
+    // 48-byte high-entropy test key (> MIN_MASTER_KEY_BYTES of 32).
+    const TEST_MASTER_KEY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto should init");
+        let crypto = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto should init");
 
         let plaintext = b"secret-payment-field";
         let blob = crypto.encrypt(plaintext).expect("encrypt should work");
@@ -139,9 +157,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_short_master_key() {
+        // A 1-character key is accepted structurally but provides ~1 char of
+        // entropy; the floor rejects it so operators don't ship a weak key
+        // that HKDF would silently stretch to 32 bytes.
+        let result = CryptoService::from_master_key("x");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn decrypt_fails_with_wrong_key() {
-        let crypto_a = CryptoService::from_master_key("master-key-a").expect("crypto A");
-        let crypto_b = CryptoService::from_master_key("master-key-b").expect("crypto B");
+        let crypto_a =
+            CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto A");
+        let crypto_b = CryptoService::from_master_key(
+            "abcdef0123456789abcdef0123456789abcdef0123456789ab",
+        )
+        .expect("crypto B");
         let blob = crypto_a.encrypt(b"secret").expect("encrypt");
         let result = crypto_b.decrypt(&blob);
         assert!(result.is_err());
@@ -149,7 +180,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_unsupported_algorithm() {
-        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto");
+        let crypto = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto");
         let blob = EncryptedBlob {
             algorithm: "AES-128-GCM".to_string(),
             nonce_b64: "AAAAAAAAAAAAAAAA".to_string(),
@@ -161,7 +192,7 @@ mod tests {
 
     #[test]
     fn decrypt_rejects_tampered_ciphertext() {
-        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto");
+        let crypto = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto");
         let mut blob = crypto.encrypt(b"secret").expect("encrypt");
         blob.ciphertext_b64.push('A');
         let result = crypto.decrypt(&blob);

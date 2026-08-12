@@ -86,10 +86,13 @@ fn run_middleware(request: &HttpRequest, auth: &AuthConfig) -> Result<(), HttpRe
     for stage in DEFAULT_MIDDLEWARE_CHAIN {
         match stage {
             MiddlewareStage::Authentication => {
-                if request.path != "/health" && request.path != "/metrics" {
+                // Only /health is unauthenticated (liveness probe).
+                // /metrics exposes operational data and is gated at the same
+                // level as /status (read access) via the resource mapping below.
+                if request.path != "/health" {
                     let resource = if request.path == "/ready" {
                         AdminResource::Ready
-                    } else if request.path == "/status" {
+                    } else if request.path == "/status" || request.path == "/metrics" {
                         AdminResource::Status
                     } else if request.path == "/reload" {
                         AdminResource::Reload

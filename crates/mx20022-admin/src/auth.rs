@@ -185,11 +185,23 @@ fn authorize_jwt(
         .ok_or(AuthError::InvalidBearer)?;
 
     let mut validation = Validation::new(Algorithm::HS256);
+    // Build the required-claims set dynamically: exp is always required
+    // (jsonwebtoken default), and iss/aud are required *when configured*.
+    // Without requiring them, a token that omits the claim entirely bypasses
+    // the audience/issuer check (jsonwebtoken only validates the claim if it
+    // is present).
+    let mut required_spec_claims: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
     if let Some(iss) = &config.jwt_issuer {
         validation.set_issuer(&[iss]);
+        required_spec_claims.insert("iss");
     }
     if let Some(aud) = &config.jwt_audience {
         validation.set_audience(&[aud]);
+        required_spec_claims.insert("aud");
+    }
+    if !required_spec_claims.is_empty() {
+        validation.set_required_spec_claims(&required_spec_claims.into_iter().collect::<Vec<_>>());
     }
 
     let data = decode::<JwtClaims>(
@@ -274,6 +286,10 @@ mod tests {
         sub: String,
         exp: usize,
         roles: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aud: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iss: Option<String>,
     }
 
     #[test]
@@ -288,6 +304,8 @@ mod tests {
             sub: "operator".to_string(),
             exp: 4_102_444_800,
             roles: vec!["admin.tx.read".to_string()],
+            aud: None,
+            iss: None,
         };
         let token = encode(
             &Header::default(),
@@ -318,6 +336,8 @@ mod tests {
             sub: "readonly".to_string(),
             exp: 4_102_444_800,
             roles: vec!["admin.read".to_string()],
+            aud: None,
+            iss: None,
         };
         let token = encode(
             &Header::default(),
@@ -334,6 +354,100 @@ mod tests {
             None,
         );
         assert!(matches!(result, Err(AuthError::Forbidden)));
+    }
+
+    #[test]
+    fn jwt_audience_required_when_configured() {
+        // Regression: a token that omits the `aud` claim must be rejected
+        // when an audience is configured. Without requiring the claim,
+        // jsonwebtoken skips audience validation for claim-less tokens,
+        // letting them bypass the audience check.
+        let cfg = AuthConfig {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
+            jwt_audience: Some("mx20022-admin".to_string()),
+            ready_roles: vec!["admin.read".to_string()],
+            ..AuthConfig::default()
+        };
+        let claims_without_aud = Claims {
+            sub: "operator".to_string(),
+            exp: 4_102_444_800,
+            roles: vec!["admin.read".to_string()],
+            aud: None,
+            iss: None,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims_without_aud,
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header = format!("Bearer {token}");
+
+        let result = authorize_request(
+            &cfg,
+            AdminResource::Ready,
+            Some(header.as_str()),
+            None,
+        );
+        assert!(
+            matches!(result, Err(AuthError::InvalidBearer)),
+            "token missing aud should be rejected: {result:?}"
+        );
+
+        // A token carrying the configured audience is accepted.
+        let claims_with_aud = Claims {
+            sub: "operator".to_string(),
+            exp: 4_102_444_800,
+            roles: vec!["admin.read".to_string()],
+            aud: Some("mx20022-admin".to_string()),
+            iss: None,
+        };
+        let token_ok = encode(
+            &Header::default(),
+            &claims_with_aud,
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header_ok = format!("Bearer {token_ok}");
+        let result_ok = authorize_request(
+            &cfg,
+            AdminResource::Ready,
+            Some(header_ok.as_str()),
+            None,
+        );
+        assert!(result_ok.is_ok(), "token with correct aud should pass");
+    }
+
+    #[test]
+    fn jwt_issuer_required_when_configured() {
+        let cfg = AuthConfig {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
+            jwt_issuer: Some("mx20022-issuer".to_string()),
+            ready_roles: vec!["admin.read".to_string()],
+            ..AuthConfig::default()
+        };
+        let claims_without_iss = Claims {
+            sub: "operator".to_string(),
+            exp: 4_102_444_800,
+            roles: vec!["admin.read".to_string()],
+            aud: None,
+            iss: None,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims_without_iss,
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header = format!("Bearer {token}");
+
+        let result = authorize_request(&cfg, AdminResource::Ready, Some(header.as_str()), None);
+        assert!(
+            matches!(result, Err(AuthError::InvalidBearer)),
+            "token missing iss should be rejected: {result:?}"
+        );
     }
 
     #[test]

@@ -123,11 +123,23 @@ fn authorize_inbound_jwt(
         .ok_or_else(|| ChannelError::new("inbound auth is misconfigured"))?;
 
     let mut validation = Validation::new(Algorithm::HS256);
+    // Build the required-claims set dynamically: exp is always required
+    // (jsonwebtoken default), and iss/aud are required *when configured*.
+    // Without requiring them, a token that omits the claim entirely bypasses
+    // the audience/issuer check (jsonwebtoken only validates the claim if it
+    // is present).
+    let mut required_spec_claims: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
     if let Some(iss) = &config.jwt_issuer {
         validation.set_issuer(&[iss]);
+        required_spec_claims.insert("iss");
     }
     if let Some(aud) = &config.jwt_audience {
         validation.set_audience(&[aud]);
+        required_spec_claims.insert("aud");
+    }
+    if !required_spec_claims.is_empty() {
+        validation.set_required_spec_claims(&required_spec_claims.into_iter().collect::<Vec<_>>());
     }
 
     let data = decode::<JwtClaims>(
