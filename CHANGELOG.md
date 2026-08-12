@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Master keys stay raw UTF-8 unless prefixed with `hex:` or `base64:`. Silent decode of hex-looking or base64-valid strings is gone so existing encrypted blobs keep decrypting.
+- `tls_enabled=true` without both `tls_cert` and `tls_key` is now a config error. TCP security is derived from the cert/key pair, not the flag alone.
+- Admin `jwt_hs256` rejects empty role lists. Unknown `admin_auth.mode` strings fail closed instead of becoming `disabled`.
+- Coverage floor stays at 60 until a fresh llvm-cov measurement.
+
 ### Added
 - New root documentation set:
   - `README.md` rewritten with actionable setup/run/ops guidance.

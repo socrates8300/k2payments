@@ -26,10 +26,8 @@ impl std::fmt::Debug for CryptoService {
 }
 
 impl CryptoService {
-    /// Minimum decoded byte length of the master key. Hex and standard
-    /// base64 values are measured after decode; anything else is measured as
-    /// raw UTF-8 bytes. HKDF expands this material to the 32-byte AES-256
-    /// key, so a shorter secret is rejected instead of being stretched.
+    /// Minimum byte length of the HKDF input. Unprefixed keys are raw UTF-8.
+    /// `hex:` and `base64:` prefixes opt in to decode-then-measure.
     const MIN_MASTER_KEY_BYTES: usize = 32;
 
     pub fn from_master_key(master_key: &str) -> Result<Self, CryptoError> {
@@ -39,10 +37,10 @@ impl CryptoService {
                 "master key must not be empty".to_string(),
             ));
         }
-        let key_material = decode_master_key_material(trimmed);
+        let key_material = decode_master_key_material(trimmed)?;
         if key_material.len() < Self::MIN_MASTER_KEY_BYTES {
             return Err(CryptoError::InvalidMasterKey(format!(
-                "master key must decode to at least {} bytes (got {}); use 32+ random bytes, 64 hex chars, or base64 of 32+ bytes",
+                "master key must be at least {} bytes of key material (got {}); unprefixed values are raw UTF-8, or use hex:<64+ hex chars> / base64:<32+ bytes>",
                 Self::MIN_MASTER_KEY_BYTES,
                 key_material.len()
             )));
@@ -107,16 +105,22 @@ impl CryptoService {
     }
 }
 
-fn decode_master_key_material(trimmed: &str) -> Vec<u8> {
-    if let Some(bytes) = decode_hex(trimmed) {
-        return bytes;
+fn decode_master_key_material(trimmed: &str) -> Result<Vec<u8>, CryptoError> {
+    if let Some(hex) = trimmed.strip_prefix("hex:") {
+        return decode_hex(hex).ok_or_else(|| {
+            CryptoError::InvalidMasterKey(
+                "master key hex: prefix requires even-length hex digits".to_string(),
+            )
+        });
     }
-    if let Ok(bytes) = STANDARD.decode(trimmed) {
-        if !bytes.is_empty() {
-            return bytes;
-        }
+    if let Some(b64) = trimmed.strip_prefix("base64:") {
+        return STANDARD.decode(b64).map_err(|error| {
+            CryptoError::InvalidMasterKey(format!(
+                "master key base64: prefix is not valid base64: {error}"
+            ))
+        });
     }
-    trimmed.as_bytes().to_vec()
+    Ok(trimmed.as_bytes().to_vec())
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
@@ -161,7 +165,8 @@ pub enum CryptoError {
 mod tests {
     use crate::{CryptoService, EncryptedBlob};
 
-    // 32 decoded bytes as 64 hex chars.
+    // 64 raw UTF-8 bytes. Unprefixed hex-looking strings stay raw so existing
+    // deployments keep the same HKDF input.
     const TEST_MASTER_KEY: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -189,15 +194,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_32_hex_chars_as_16_decoded_bytes() {
-        let result = CryptoService::from_master_key("0123456789abcdef0123456789abcdef");
-        assert!(result.is_err());
+    fn unprefixed_hex_looking_key_stays_raw_utf8() {
+        let raw = TEST_MASTER_KEY;
+        let prefixed = format!("hex:{raw}");
+        let from_raw = CryptoService::from_master_key(raw).expect("raw key");
+        let from_hex = CryptoService::from_master_key(&prefixed).expect("hex: key");
+        let blob = from_raw.encrypt(b"secret").expect("encrypt");
+        assert!(
+            from_hex.decrypt(&blob).is_err(),
+            "hex: decode must not match raw UTF-8 derivation of the same digits"
+        );
     }
 
     #[test]
-    fn accepts_64_hex_chars_as_32_decoded_bytes() {
-        let result = CryptoService::from_master_key(TEST_MASTER_KEY);
-        assert!(result.is_ok());
+    fn prefixed_hex_measures_decoded_bytes() {
+        assert!(CryptoService::from_master_key("hex:0123456789abcdef0123456789abcdef").is_err());
+        assert!(CryptoService::from_master_key(&format!("hex:{TEST_MASTER_KEY}")).is_ok());
+    }
+
+    #[test]
+    fn unprefixed_base64_looking_passphrase_stays_raw() {
+        // 40 alphanumeric chars: valid standard base64 for 30 bytes, so a
+        // silent decode would reject it. Raw UTF-8 is 40 bytes and must pass.
+        let passphrase = "abcdefghijklmnopqrstuvwxyzabcdefghijklmn";
+        assert!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, passphrase).is_ok()
+        );
+        assert!(CryptoService::from_master_key(passphrase).is_ok());
+        assert!(CryptoService::from_master_key(&format!("base64:{passphrase}")).is_err());
     }
 
     #[test]

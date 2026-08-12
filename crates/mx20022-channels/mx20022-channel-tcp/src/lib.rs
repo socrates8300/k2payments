@@ -18,8 +18,11 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_rustls::TlsAcceptor;
+
+const TCP_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_MAX_INFLIGHT: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TcpFraming {
@@ -92,6 +95,7 @@ impl InboundChannel for TcpInboundChannel {
         let listener = TcpListener::bind(&self.config.bind).await.map_err(|e| {
             ChannelError::new(format!("tcp bind failed on {}: {e}", self.config.bind))
         })?;
+        let inflight = Arc::new(Semaphore::new(TCP_MAX_INFLIGHT));
 
         while !self.shutdown.load(Ordering::Relaxed) {
             if self.paused.load(Ordering::Relaxed) {
@@ -104,32 +108,37 @@ impl InboundChannel for TcpInboundChannel {
                 .await
                 .map_err(|e| ChannelError::new(format!("tcp accept failed: {e}")))?;
 
+            let Ok(permit) = inflight.clone().try_acquire_owned() else {
+                tracing::warn!("tcp inbound at concurrency limit; dropping connection");
+                continue;
+            };
+
             let sender = sender.clone();
             let framing = self.config.framing;
             let content_type = self.config.content_type.clone();
             let auth_token = self.config.auth_token.clone();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                // Handshake first (if TLS), then process. We pass ownership
-                // of the accepted stream into a small async block so the
-                // concrete type is resolved here and process_connection
-                // stays generic over AsyncRead+AsyncWrite.
+                let _permit = permit;
                 let result = match acceptor {
-                    Some(acceptor) => match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            process_connection(
-                                tls_stream,
-                                framing,
-                                content_type,
-                                auth_token,
-                                sender,
-                            )
-                            .await
+                    Some(acceptor) => {
+                        match tokio::time::timeout(TCP_IO_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => {
+                                process_connection(
+                                    tls_stream,
+                                    framing,
+                                    content_type,
+                                    auth_token,
+                                    sender,
+                                )
+                                .await
+                            }
+                            Ok(Err(error)) => {
+                                Err(ChannelError::new(format!("tls handshake failed: {error}")))
+                            }
+                            Err(_) => Err(ChannelError::new("tls handshake timed out")),
                         }
-                        Err(error) => {
-                            Err(ChannelError::new(format!("tls handshake failed: {error}")))
-                        }
-                    },
+                    }
                     None => {
                         process_connection(stream, framing, content_type, auth_token, sender).await
                     }
@@ -270,11 +279,20 @@ where
         TcpFraming::LengthPrefixed => {
             let mut stream = stream;
             if let Some(expected) = auth_token.as_ref().map(ExposeSecret::expose_secret) {
-                let auth_frame = read_length_prefixed(&mut stream).await?;
+                let auth_frame = first_frame_timeout(read_length_prefixed(&mut stream)).await?;
                 let presented = decode_utf8_payload(&auth_frame)?;
                 if !constant_time_eq(presented.trim(), expected) {
                     return Err(ChannelError::new("tcp auth failed"));
                 }
+            } else {
+                let frame = first_frame_timeout(read_length_prefixed(&mut stream)).await?;
+                sender
+                    .send(InboundMessage {
+                        raw: decode_utf8_payload(&frame)?,
+                        content_type: content_type.clone(),
+                    })
+                    .await
+                    .map_err(|e| ChannelError::new(format!("inbound queue send failed: {e}")))?;
             }
             loop {
                 let frame = read_length_prefixed(&mut stream).await?;
@@ -291,11 +309,14 @@ where
             let mut reader = BufReader::new(stream);
             if let Some(expected) = auth_token.as_ref().map(ExposeSecret::expose_secret) {
                 let mut auth_buf = Vec::new();
-                let bytes = (&mut reader)
-                    .take(MAX_FRAME_SIZE as u64 + 1)
-                    .read_until(delimiter, &mut auth_buf)
-                    .await
-                    .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))?;
+                let bytes = first_frame_timeout(async {
+                    (&mut reader)
+                        .take(MAX_FRAME_SIZE as u64 + 1)
+                        .read_until(delimiter, &mut auth_buf)
+                        .await
+                        .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))
+                })
+                .await?;
                 if bytes == 0 {
                     return Err(ChannelError::new("tcp auth failed"));
                 }
@@ -307,13 +328,22 @@ where
                     return Err(ChannelError::new("tcp auth failed"));
                 }
             }
+            let mut first_payload = auth_token.is_none();
             loop {
                 let mut buf = Vec::new();
-                let bytes = (&mut reader)
-                    .take(MAX_FRAME_SIZE as u64 + 1)
-                    .read_until(delimiter, &mut buf)
-                    .await
-                    .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))?;
+                let read = async {
+                    (&mut reader)
+                        .take(MAX_FRAME_SIZE as u64 + 1)
+                        .read_until(delimiter, &mut buf)
+                        .await
+                        .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))
+                };
+                let bytes = if first_payload {
+                    first_payload = false;
+                    first_frame_timeout(read).await?
+                } else {
+                    read.await?
+                };
                 if bytes == 0 {
                     return Ok(());
                 }
@@ -336,6 +366,15 @@ where
             }
         }
     }
+}
+
+async fn first_frame_timeout<F, T>(op: F) -> Result<T, ChannelError>
+where
+    F: std::future::Future<Output = Result<T, ChannelError>>,
+{
+    tokio::time::timeout(TCP_IO_TIMEOUT, op)
+        .await
+        .map_err(|_| ChannelError::new("tcp first frame timed out"))?
 }
 
 const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;

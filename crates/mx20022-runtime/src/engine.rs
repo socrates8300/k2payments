@@ -954,10 +954,6 @@ participants = [{{ name = "message-logger" }}]
             response_str.split("\r\n").next().unwrap_or("?")
         );
 
-        // Give the pipeline a moment to enqueue the message, then fire
-        // shutdown. Even if the message is still in-flight, the drain must
-        // wait for it (or time out at 30s) and return Ok.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = shutdown_tx.send(());
 
         let result = tokio::time::timeout(Duration::from_secs(10), engine_handle)
@@ -967,6 +963,33 @@ participants = [{{ name = "message-logger" }}]
             result.is_ok(),
             "run_pipelines should return Ok after drain: {:?}",
             result.err()
+        );
+
+        let store = app.store_handle();
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let page = store
+                    .query(mx20022_store::StoreQuery {
+                        pipeline: Some("demo".to_string()),
+                        message_type: None,
+                        state: None,
+                        since: None,
+                        until: None,
+                        limit: Some(8),
+                    })
+                    .await
+                    .expect("store query");
+                if let Some(record) = page.records.first() {
+                    return record.state.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("drained transaction must be persisted");
+        assert!(
+            state == "COMMITTED" || state == "POISON",
+            "drain must leave the transaction terminal, got {state}"
         );
     }
 }

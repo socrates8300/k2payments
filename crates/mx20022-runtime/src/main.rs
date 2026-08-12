@@ -106,7 +106,7 @@ async fn run(
         .admin_grpc_bind
         .clone()
         .unwrap_or_else(|| "127.0.0.1:9091".to_string());
-    let admin_auth = build_admin_auth(&config);
+    let admin_auth = build_admin_auth(&config)?;
     let admin_tls = build_admin_tls(&config);
     let admin_cors_allowed_origins = config.runtime.admin_cors_allowed_origins.clone();
     let service_mode = (cli.run_pipelines, cli.serve_admin, cli.serve_admin_grpc);
@@ -418,15 +418,35 @@ fn is_loopback_bind(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_admin_auth(config: &RuntimeConfig) -> AdminAuthConfig {
-    let mode = match config.runtime.admin_auth.mode.as_str() {
-        "disabled" => AdminAuthMode::Disabled,
-        "legacy_bearer" => AdminAuthMode::LegacyBearer,
-        "jwt_hs256" => AdminAuthMode::JwtHs256,
-        _ => AdminAuthMode::Disabled,
-    };
+fn admin_auth_mode(mode: &str) -> Result<AdminAuthMode, RuntimeBootstrapError> {
+    match mode {
+        "disabled" => Ok(AdminAuthMode::Disabled),
+        "legacy_bearer" => Ok(AdminAuthMode::LegacyBearer),
+        "jwt_hs256" => Ok(AdminAuthMode::JwtHs256),
+        other => Err(RuntimeBootstrapError::InvalidAdminAuthMode {
+            mode: other.to_string(),
+        }),
+    }
+}
 
-    AdminAuthConfig {
+fn build_admin_auth(config: &RuntimeConfig) -> Result<AdminAuthConfig, RuntimeBootstrapError> {
+    let mode = admin_auth_mode(&config.runtime.admin_auth.mode)?;
+    if mode == AdminAuthMode::JwtHs256 {
+        for (name, roles) in [
+            ("ready_roles", &config.runtime.admin_auth.ready_roles),
+            ("status_roles", &config.runtime.admin_auth.status_roles),
+            ("tx_roles", &config.runtime.admin_auth.tx_roles),
+            ("reload_roles", &config.runtime.admin_auth.reload_roles),
+        ] {
+            if roles.iter().all(|role| role.trim().is_empty()) {
+                return Err(RuntimeBootstrapError::AdminJwtMissingRoles {
+                    field: name.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(AdminAuthConfig {
         mode,
         jwt_hs256_secret: config.runtime.admin_auth.jwt_hs256_secret.clone(),
         legacy_bearer_token: config.runtime.admin_auth.legacy_bearer_token.clone(),
@@ -440,7 +460,7 @@ fn build_admin_auth(config: &RuntimeConfig) -> AdminAuthConfig {
         require_mtls_subject: config.runtime.admin_auth.require_mtls_subject,
         mtls_subject_header: config.runtime.admin_auth.mtls_subject_header.clone(),
         mtls_allowed_subjects: config.runtime.admin_auth.mtls_allowed_subjects.clone(),
-    }
+    })
 }
 
 async fn build_admin_controller(
@@ -593,11 +613,17 @@ enum RuntimeBootstrapError {
     Engine(#[from] engine::EngineError),
     #[error("admin service is bound to non-loopback address `{bind}` with auth disabled; refusing to start. Either bind to 127.0.0.1/localhost, enable runtime.admin_auth.mode (legacy_bearer or jwt_hs256), or set runtime.admin_allow_insecure_bind=true to acknowledge the risk")]
     InsecureAdminBind { bind: String },
+    #[error(
+        "runtime.admin_auth.mode `{mode}` is invalid (expected disabled|legacy_bearer|jwt_hs256)"
+    )]
+    InvalidAdminAuthMode { mode: String },
+    #[error("runtime.admin_auth.{field} must be non-empty when mode=jwt_hs256")]
+    AdminJwtMissingRoles { field: String },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_bind, reject_insecure_admin_bind};
+    use super::{admin_auth_mode, is_loopback_bind, reject_insecure_admin_bind};
 
     #[test]
     fn loopback_detection_for_ipv4() {
@@ -642,6 +668,12 @@ mod tests {
         let result =
             reject_insecure_admin_bind(true, false, true, false, "0.0.0.0:9090", "127.0.0.1:9091");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_admin_auth_mode_fails_closed() {
+        let err = admin_auth_mode("jwt-hs256").expect_err("typo must not become Disabled");
+        assert!(err.to_string().contains("jwt-hs256"));
     }
 
     #[test]
