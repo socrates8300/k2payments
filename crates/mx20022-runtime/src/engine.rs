@@ -176,6 +176,14 @@ pub async fn run_pipelines(
         let tx_id_prefix = tx_id_prefix.clone();
         tasks.spawn(async move {
             let semaphore = Arc::new(Semaphore::new(max_concurrent));
+            // Per-message tasks live in this inner JoinSet instead of being
+            // detached via tokio::spawn. That way, when the outer receiver
+            // loop exits (inbound channel closed on shutdown), we drain the
+            // in-flight transactions here before returning. Because this task
+            // is itself in the outer `tasks` JoinSet, the engine's shutdown
+            // drain now actually waits for in-flight transactions to complete
+            // (or time out) rather than orphaning them mid-flight.
+            let mut message_tasks: JoinSet<()> = JoinSet::new();
 
             while let Some(msg) = rx.recv().await {
                 let permit = semaphore
@@ -191,7 +199,7 @@ pub async fn run_pipelines(
                 let raw = msg.raw;
                 let tx_id_prefix = tx_id_prefix.clone();
 
-                tokio::spawn(async move {
+                message_tasks.spawn(async move {
                     let _permit = permit;
                     let tx_id = next_tx_id(&tx_id_prefix);
 
@@ -207,6 +215,21 @@ pub async fn run_pipelines(
                         );
                     }
                 });
+            }
+
+            // Inbound channel closed (shutdown). Drain in-flight transactions.
+            // A panic in a message task surfaces as a JoinError here; we log
+            // and continue draining the rest rather than aborting the whole
+            // pipeline, so one bad message doesn't prevent the others from
+            // completing during shutdown.
+            while let Some(res) = message_tasks.join_next().await {
+                if let Err(error) = res {
+                    if error.is_panic() {
+                        tracing::error!(error = %error, "message task panicked during drain");
+                    } else {
+                        tracing::warn!(error = %error, "message task cancelled during drain");
+                    }
+                }
             }
 
             Ok(())
