@@ -68,3 +68,18 @@ impl ChannelError {
         }
     }
 }
+
+/// Poll `addr` until a TCP connect succeeds or `timeout` elapses.
+pub async fn wait_for_tcp(addr: impl AsRef<str>, timeout: std::time::Duration) -> bool {
+    let addr = addr.as_ref().to_string();
+    tokio::time::timeout(timeout, async {
+        loop {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}

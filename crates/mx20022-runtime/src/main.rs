@@ -110,23 +110,14 @@ async fn run(
     let admin_tls = build_admin_tls(&config);
     let admin_cors_allowed_origins = config.runtime.admin_cors_allowed_origins.clone();
     let service_mode = (cli.run_pipelines, cli.serve_admin, cli.serve_admin_grpc);
-    // Refuse to start an admin surface on a non-loopback bind with auth
-    // disabled. Without this, a misconfigured deployment would expose
-    // unauthenticated admin endpoints (reload, transaction readout) to the
-    // network. Operators who genuinely want this must set
-    // runtime.admin_allow_insecure_bind=true to acknowledge the risk.
-    if matches!(admin_auth.mode, AdminAuthMode::Disabled)
-        && (cli.serve_admin || cli.serve_admin_grpc)
-        && !config.runtime.admin_allow_insecure_bind
-    {
-        for bind in [admin_bind.as_str(), admin_grpc_bind.as_str()] {
-            if !is_loopback_bind(bind) {
-                return Err(RuntimeBootstrapError::InsecureAdminBind {
-                    bind: bind.to_string(),
-                });
-            }
-        }
-    }
+    reject_insecure_admin_bind(
+        matches!(admin_auth.mode, AdminAuthMode::Disabled),
+        config.runtime.admin_allow_insecure_bind,
+        cli.serve_admin,
+        cli.serve_admin_grpc,
+        &admin_bind,
+        &admin_grpc_bind,
+    )?;
 
     match service_mode {
         (true, true, true) => {
@@ -365,6 +356,47 @@ fn admin_tls_pair(config: &RuntimeConfig) -> Option<(String, String)> {
     }
 }
 
+fn reject_insecure_admin_bind(
+    auth_disabled: bool,
+    allow_insecure: bool,
+    serve_admin: bool,
+    serve_admin_grpc: bool,
+    admin_bind: &str,
+    admin_grpc_bind: &str,
+) -> Result<(), RuntimeBootstrapError> {
+    if !auth_disabled {
+        return Ok(());
+    }
+
+    let served: Vec<&str> = [
+        serve_admin.then_some(admin_bind),
+        serve_admin_grpc.then_some(admin_grpc_bind),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if served.is_empty() {
+        return Ok(());
+    }
+
+    if allow_insecure {
+        tracing::warn!(
+            binds = ?served,
+            "admin auth is disabled and admin_allow_insecure_bind=true; admin surface is reachable without credentials"
+        );
+        return Ok(());
+    }
+
+    for bind in served {
+        if !is_loopback_bind(bind) {
+            return Err(RuntimeBootstrapError::InsecureAdminBind {
+                bind: bind.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Returns true if `bind` (a `host:port` or `[ip]:port` string) points at a
 /// loopback address. Conservative: only explicit loopback IP literals
 /// (127.0.0.0/8, ::1) and the `localhost` hostname are treated as loopback;
@@ -565,7 +597,7 @@ enum RuntimeBootstrapError {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_bind;
+    use super::{is_loopback_bind, reject_insecure_admin_bind};
 
     #[test]
     fn loopback_detection_for_ipv4() {
@@ -586,5 +618,36 @@ mod tests {
         assert!(!is_loopback_bind("[::]:9090"));
         assert!(!is_loopback_bind("10.0.0.5:9090"));
         assert!(!is_loopback_bind("admin.internal:9090"));
+    }
+
+    #[test]
+    fn insecure_bind_check_ignores_unused_admin_surfaces() {
+        let result =
+            reject_insecure_admin_bind(true, false, true, false, "127.0.0.1:9090", "0.0.0.0:9091");
+        assert!(
+            result.is_ok(),
+            "unused gRPC bind must not fail HTTP-only serve: {result:?}"
+        );
+
+        let grpc_only =
+            reject_insecure_admin_bind(true, false, false, true, "0.0.0.0:9090", "127.0.0.1:9091");
+        assert!(
+            grpc_only.is_ok(),
+            "unused HTTP bind must not fail gRPC-only serve: {grpc_only:?}"
+        );
+    }
+
+    #[test]
+    fn insecure_bind_check_rejects_served_non_loopback() {
+        let result =
+            reject_insecure_admin_bind(true, false, true, false, "0.0.0.0:9090", "127.0.0.1:9091");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn insecure_bind_check_allows_explicit_opt_in() {
+        let result =
+            reject_insecure_admin_bind(true, true, true, true, "0.0.0.0:9090", "0.0.0.0:9091");
+        assert!(result.is_ok());
     }
 }

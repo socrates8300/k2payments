@@ -26,10 +26,10 @@ impl std::fmt::Debug for CryptoService {
 }
 
 impl CryptoService {
-    /// Minimum raw byte length of the master key. HKDF expands this to the
-    /// 32-byte AES-256 key, so a master key shorter than 32 bytes provides
-    /// less than 256 bits of effective key strength. Operators must supply a
-    /// high-entropy secret (e.g. 32+ random bytes, base64-encoded).
+    /// Minimum decoded byte length of the master key. Hex and standard
+    /// base64 values are measured after decode; anything else is measured as
+    /// raw UTF-8 bytes. HKDF expands this material to the 32-byte AES-256
+    /// key, so a shorter secret is rejected instead of being stretched.
     const MIN_MASTER_KEY_BYTES: usize = 32;
 
     pub fn from_master_key(master_key: &str) -> Result<Self, CryptoError> {
@@ -39,16 +39,17 @@ impl CryptoService {
                 "master key must not be empty".to_string(),
             ));
         }
-        if trimmed.len() < Self::MIN_MASTER_KEY_BYTES {
+        let key_material = decode_master_key_material(trimmed);
+        if key_material.len() < Self::MIN_MASTER_KEY_BYTES {
             return Err(CryptoError::InvalidMasterKey(format!(
-                "master key must be at least {} bytes (got {}); use a high-entropy secret such as 32+ random bytes",
+                "master key must decode to at least {} bytes (got {}); use 32+ random bytes, 64 hex chars, or base64 of 32+ bytes",
                 Self::MIN_MASTER_KEY_BYTES,
-                trimmed.len()
+                key_material.len()
             )));
         }
 
         // Derive a fixed-length key for AES-256 using HKDF-SHA256 with a domain-separated salt.
-        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), trimmed.as_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), &key_material);
         let mut key_bytes = [0_u8; 32];
         hk.expand(b"aes-256-gcm-key", &mut key_bytes)
             .map_err(|e| CryptoError::InvalidMasterKey(format!("HKDF expand failed: {e}")))?;
@@ -106,6 +107,31 @@ impl CryptoService {
     }
 }
 
+fn decode_master_key_material(trimmed: &str) -> Vec<u8> {
+    if let Some(bytes) = decode_hex(trimmed) {
+        return bytes;
+    }
+    if let Ok(bytes) = STANDARD.decode(trimmed) {
+        if !bytes.is_empty() {
+            return bytes;
+        }
+    }
+    trimmed.as_bytes().to_vec()
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() < 2
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
+        .collect()
+}
+
 impl Drop for CryptoService {
     fn drop(&mut self) {
         self.key_bytes.fill(0);
@@ -135,8 +161,9 @@ pub enum CryptoError {
 mod tests {
     use crate::{CryptoService, EncryptedBlob};
 
-    // 48-byte high-entropy test key (> MIN_MASTER_KEY_BYTES of 32).
-    const TEST_MASTER_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    // 32 decoded bytes as 64 hex chars.
+    const TEST_MASTER_KEY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -157,19 +184,29 @@ mod tests {
 
     #[test]
     fn rejects_short_master_key() {
-        // A 1-character key is accepted structurally but provides ~1 char of
-        // entropy; the floor rejects it so operators don't ship a weak key
-        // that HKDF would silently stretch to 32 bytes.
         let result = CryptoService::from_master_key("x");
         assert!(result.is_err());
     }
 
     #[test]
+    fn rejects_32_hex_chars_as_16_decoded_bytes() {
+        let result = CryptoService::from_master_key("0123456789abcdef0123456789abcdef");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_64_hex_chars_as_32_decoded_bytes() {
+        let result = CryptoService::from_master_key(TEST_MASTER_KEY);
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn decrypt_fails_with_wrong_key() {
         let crypto_a = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto A");
-        let crypto_b =
-            CryptoService::from_master_key("abcdef0123456789abcdef0123456789abcdef0123456789ab")
-                .expect("crypto B");
+        let crypto_b = CryptoService::from_master_key(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab",
+        )
+        .expect("crypto B");
         let blob = crypto_a.encrypt(b"secret").expect("encrypt");
         let result = crypto_b.decrypt(&blob);
         assert!(result.is_err());

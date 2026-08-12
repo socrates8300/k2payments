@@ -20,6 +20,23 @@ pub fn parse_bearer_token(header: Option<&str>) -> Option<&str> {
     Some(token)
 }
 
+/// Spec claims that must be present when validating an inbound HS256 JWT.
+///
+/// `exp` is always required. `iss` and `aud` are required only when the
+/// caller has configured an issuer or audience. jsonwebtoken's
+/// `set_required_spec_claims` replaces the default set, so callers must
+/// include `exp` explicitly whenever they set this list.
+pub fn jwt_required_spec_claims(issuer: Option<&str>, audience: Option<&str>) -> Vec<&'static str> {
+    let mut claims = vec!["exp"];
+    if issuer.is_some() {
+        claims.push("iss");
+    }
+    if audience.is_some() {
+        claims.push("aud");
+    }
+    claims
+}
+
 /// Constant-time equality comparison for two strings.
 ///
 /// This is intended for comparing secrets (e.g. bearer tokens) without
@@ -41,7 +58,7 @@ pub fn constant_time_eq(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, parse_bearer_token};
+    use super::{constant_time_eq, jwt_required_spec_claims, parse_bearer_token};
 
     #[test]
     fn parse_bearer_token_extracts_token() {
@@ -96,5 +113,16 @@ mod tests {
     #[test]
     fn constant_time_eq_rejects_mismatched_lengths() {
         assert!(!constant_time_eq("short", "a-very-different-length"));
+    }
+
+    #[test]
+    fn jwt_required_spec_claims_always_includes_exp() {
+        assert_eq!(jwt_required_spec_claims(None, None), ["exp"]);
+        assert_eq!(jwt_required_spec_claims(Some("iss"), None), ["exp", "iss"]);
+        assert_eq!(jwt_required_spec_claims(None, Some("aud")), ["exp", "aud"]);
+        assert_eq!(
+            jwt_required_spec_claims(Some("iss"), Some("aud")),
+            ["exp", "iss", "aud"]
+        );
     }
 }

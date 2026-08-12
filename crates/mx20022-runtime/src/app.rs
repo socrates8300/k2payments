@@ -502,48 +502,10 @@ impl RuntimeApp {
                     Ok(_) => report.recovered += 1,
                     Err(error) => {
                         report.failed += 1;
-                        tracing::error!(
-                            tx_id = %tx_id,
-                            pipeline = %pipeline,
-                            state = %state,
-                            error = %error,
-                            "startup recovery replay failed; dead-lettering transaction"
-                        );
-                        // Quarantine the transaction so it does not replay on
-                        // every restart: save the raw message to the
-                        // dead-letter store (operators can replay it via the
-                        // admin replay endpoint once the root cause is fixed)
-                        // and mark the transaction Poison, which is outside
-                        // the recovery query states above.
-                        if let Err(dl_error) = self
-                            .store
-                            .save_dead_letter(&DeadLetter {
-                                id: format!("DL-{tx_id}"),
-                                tx_id: tx_id.clone(),
-                                reason: format!("recovery failed: {error}"),
-                                failed_at: std::time::SystemTime::now(),
-                                raw_message: raw_message.clone(),
-                            })
+                        if self
+                            .maybe_quarantine_failed_recovery(&tx_id, &state, &raw_message, &error)
                             .await
                         {
-                            tracing::error!(
-                                tx_id = %tx_id,
-                                error = %dl_error,
-                                "failed to save dead letter during recovery; \
-                                 transaction will replay on next restart"
-                            );
-                        } else if let Err(c_error) = self
-                            .store
-                            .complete_transaction(&tx_id, mx20022_store::Outcome::Poison)
-                            .await
-                        {
-                            tracing::error!(
-                                tx_id = %tx_id,
-                                error = %c_error,
-                                "failed to mark transaction Poison after dead-letter; \
-                                 transaction will replay on next restart"
-                            );
-                        } else {
                             report.dead_lettered += 1;
                         }
                     }
@@ -552,6 +514,76 @@ impl RuntimeApp {
         }
 
         Ok(report)
+    }
+
+    async fn maybe_quarantine_failed_recovery(
+        &self,
+        tx_id: &str,
+        prior_state: &str,
+        raw_message: &str,
+        error: &RuntimeBuildError,
+    ) -> bool {
+        let current_state = match self.store.find_by_id(tx_id).await {
+            Ok(Some(record)) => record.state,
+            Ok(None) => prior_state.to_string(),
+            Err(store_err) => {
+                tracing::error!(
+                    tx_id = %tx_id,
+                    error = %store_err,
+                    "recovery failed and the row could not be re-read; leaving for retry"
+                );
+                return false;
+            }
+        };
+
+        if !recovery_should_quarantine(&current_state, error) {
+            tracing::error!(
+                tx_id = %tx_id,
+                state = %current_state,
+                error = %error,
+                "recovery replay failed; leaving transaction in place"
+            );
+            return false;
+        }
+
+        tracing::error!(
+            tx_id = %tx_id,
+            state = %current_state,
+            error = %error,
+            "startup recovery replay failed permanently; dead-lettering transaction"
+        );
+
+        if let Err(dl_error) = self
+            .store
+            .save_dead_letter(&DeadLetter {
+                id: format!("DL-{tx_id}"),
+                tx_id: tx_id.to_string(),
+                reason: format!("recovery failed: {error}"),
+                failed_at: std::time::SystemTime::now(),
+                raw_message: raw_message.to_string(),
+            })
+            .await
+        {
+            tracing::error!(
+                tx_id = %tx_id,
+                error = %dl_error,
+                "failed to save dead letter during recovery; transaction will replay on next restart"
+            );
+            return false;
+        }
+        if let Err(c_error) = self
+            .store
+            .complete_transaction(tx_id, mx20022_store::Outcome::Poison)
+            .await
+        {
+            tracing::error!(
+                tx_id = %tx_id,
+                error = %c_error,
+                "failed to mark transaction Poison after dead-letter; transaction will replay on next restart"
+            );
+            return false;
+        }
+        true
     }
 
     pub async fn reload_participant_configs(
@@ -1095,6 +1127,27 @@ fn read_f64(cfg: &ParticipantConfig, key: &str) -> Option<f64> {
         })
 }
 
+const RECOVERY_STATES: &[&str] = &[
+    "RECEIVED",
+    "PREPARING",
+    "PREPARED",
+    "COMMITTING",
+    "ABORTING",
+];
+
+fn recovery_error_is_permanent(error: &RuntimeBuildError) -> bool {
+    matches!(
+        error,
+        RuntimeBuildError::UnknownPipeline(_)
+            | RuntimeBuildError::UnknownParticipant(_)
+            | RuntimeBuildError::MessageTypeNotAccepted { .. }
+    )
+}
+
+fn recovery_should_quarantine(current_state: &str, error: &RuntimeBuildError) -> bool {
+    RECOVERY_STATES.contains(&current_state) && recovery_error_is_permanent(error)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeBuildError {
     #[error("unknown participant `{0}`")]
@@ -1524,10 +1577,8 @@ participants = [
 
     #[tokio::test]
     async fn recovery_dead_letters_transactions_that_fail_replay() {
-        // Regression: a transaction that fails recovery must be moved to the
-        // dead-letter store and marked Poison so it exits the recovery query
-        // set. Without this, a perpetually-failing tx replays on every
-        // restart forever.
+        // Permanent recovery failures (unknown pipeline) must leave the
+        // recovery query set via dead-letter + Poison.
         let config = RuntimeConfig::parse(RECOVERY_CONFIG).expect("config should parse");
         let app = RuntimeApp::from_config(&config)
             .await
@@ -1588,6 +1639,61 @@ participants = [
         assert_eq!(letters.len(), 1);
         assert_eq!(letters[0].tx_id, "TX-REC-FAIL");
         assert_eq!(letters[0].raw_message, "<Document/>");
+    }
+
+    #[test]
+    fn recovery_quarantine_skips_terminal_and_retryable_errors() {
+        use super::{recovery_should_quarantine, RuntimeBuildError};
+
+        let permanent = RuntimeBuildError::UnknownPipeline("missing".to_string());
+        let retryable = RuntimeBuildError::Outbound("downstream down".to_string());
+
+        assert!(recovery_should_quarantine("PREPARING", &permanent));
+        assert!(!recovery_should_quarantine("COMMITTED", &permanent));
+        assert!(!recovery_should_quarantine("POISON", &permanent));
+        assert!(!recovery_should_quarantine("PREPARING", &retryable));
+        assert!(!recovery_should_quarantine("COMMITTING", &retryable));
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_poison_already_committed_row() {
+        let config = RuntimeConfig::parse(RECOVERY_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let store: Arc<dyn Store> = app.store_handle();
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-REC-COMMITTED".to_string(),
+                pipeline: "recovery".to_string(),
+                source_channel: "http-in".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "COMMITTED".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: None,
+                key_fields: HashMap::new(),
+            })
+            .await
+            .expect("seed tx should succeed");
+
+        let quarantined = app
+            .maybe_quarantine_failed_recovery(
+                "TX-REC-COMMITTED",
+                "PREPARING",
+                "<Document/>",
+                &RuntimeBuildError::UnknownPipeline("missing".to_string()),
+            )
+            .await;
+        assert!(!quarantined);
+
+        let updated = store
+            .find_by_id("TX-REC-COMMITTED")
+            .await
+            .expect("lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(updated.state, "COMMITTED");
     }
 
     const RELOAD_CONFIG_BASE: &str = r#"

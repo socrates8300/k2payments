@@ -70,27 +70,24 @@ impl InboundChannel for TcpInboundChannel {
         // observer. The config layer's enforce_secure_channels already
         // warns/errors on this combination; this is the defense-in-depth
         // check at the channel itself.
-        let has_tls = self
-            .config
-            .tls_cert_path
-            .as_ref()
-            .zip(self.config.tls_key_path.as_ref())
-            .is_some();
-        if self.config.auth_token.is_some() && !has_tls {
+        let acceptor = match (
+            self.config.tls_cert_path.as_deref(),
+            self.config.tls_key_path.as_deref(),
+        ) {
+            (Some(cert_path), Some(key_path)) => Some(build_tls_acceptor(cert_path, key_path)?),
+            (None, None) => None,
+            _ => {
+                return Err(ChannelError::new(
+                    "tcp inbound TLS requires both tls_cert and tls_key",
+                ))
+            }
+        };
+        if self.config.auth_token.is_some() && acceptor.is_none() {
             return Err(ChannelError::new(
                 "tcp inbound auth_token requires TLS (set tls_cert/tls_key); \
                  refusing to send the shared secret in cleartext",
             ));
         }
-
-        let acceptor = if has_tls {
-            Some(build_tls_acceptor(
-                self.config.tls_cert_path.as_deref().unwrap(),
-                self.config.tls_key_path.as_deref().unwrap(),
-            )?)
-        } else {
-            None
-        };
 
         let listener = TcpListener::bind(&self.config.bind).await.map_err(|e| {
             ChannelError::new(format!("tcp bind failed on {}: {e}", self.config.bind))
@@ -439,7 +436,6 @@ mod tests {
     use super::{
         TcpFraming, TcpInboundChannel, TcpInboundConfig, TcpOutboundChannel, TcpOutboundConfig,
     };
-    use tokio::net::TcpStream;
 
     fn find_available_port() -> Option<u16> {
         match std::net::TcpListener::bind("127.0.0.1:0") {
@@ -474,24 +470,9 @@ mod tests {
             let _ = runner.run(tx).await;
         });
 
-        // Wait for the inbound listener to be ready by retrying a TCP
-        // connect until it succeeds or we time out. Replaces a fixed sleep
-        // that intermittently raced the accept loop under CI load.
-        let ready = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if TcpStream::connect(format!("127.0.0.1:{port}"))
-                    .await
-                    .is_ok()
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        // If the listener never came up (e.g. sandbox), skip like the
-        // permission-denied path below rather than fail spuriously.
-        if ready.is_err() {
+        if !mx20022_channels::wait_for_tcp(format!("127.0.0.1:{port}"), Duration::from_secs(2))
+            .await
+        {
             eprintln!("skipping tcp roundtrip test: listener not ready");
             return;
         }
@@ -527,9 +508,6 @@ mod tests {
 
     #[tokio::test]
     async fn run_refuses_auth_token_without_tls() {
-        // Regression: without TLS the shared auth_token traverses the wire in
-        // cleartext. run() must refuse to start in that configuration rather
-        // than silently expose the secret.
         let inbound = TcpInboundChannel::new(TcpInboundConfig {
             name: "tcp-in".to_string(),
             bind: "127.0.0.1:0".to_string(),
@@ -549,6 +527,27 @@ mod tests {
         assert!(
             message.contains("requires TLS"),
             "error should mention TLS requirement: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_rejects_half_configured_tls() {
+        let inbound = TcpInboundChannel::new(TcpInboundConfig {
+            name: "tcp-in".to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            framing: TcpFraming::LengthPrefixed,
+            content_type: "application/xml".to_string(),
+            auth_token: None,
+            tls_cert_path: Some("/tmp/only-cert.pem".to_string()),
+            tls_key_path: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = inbound.run(tx).await;
+        assert!(result.is_err());
+        let message = result.expect_err("error message").to_string();
+        assert!(
+            message.contains("both tls_cert and tls_key"),
+            "half-configured TLS must fail: {message}"
         );
     }
 }

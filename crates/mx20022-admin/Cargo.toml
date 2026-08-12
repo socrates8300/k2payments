@@ -26,6 +26,7 @@ secrecy.workspace = true
 
 [dev-dependencies]
 mx20022-store-sqlite = { path = "../mx20022-store/mx20022-store-sqlite" }
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 tonic-build = "0.12"

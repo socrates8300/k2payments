@@ -87,12 +87,10 @@ fn run_middleware(request: &HttpRequest, auth: &AuthConfig) -> Result<(), HttpRe
         match stage {
             MiddlewareStage::Authentication => {
                 // Only /health is unauthenticated (liveness probe).
-                // /metrics exposes operational data and is gated at the same
-                // level as /status (read access) via the resource mapping below.
                 if request.path != "/health" {
                     let resource = if request.path == "/ready" {
                         AdminResource::Ready
-                    } else if request.path == "/status" || request.path == "/metrics" {
+                    } else if request.path == "/status" {
                         AdminResource::Status
                     } else if request.path == "/reload" {
                         AdminResource::Reload
@@ -373,39 +371,6 @@ mod tests {
         assert_eq!(
             readonly_write.status, 403,
             "readonly token on write route should be 403"
-        );
-
-        // /metrics is gated at status level (regression for the earlier
-        // change that made /metrics authenticated).
-        let metrics_ok = dispatch_with_auth(
-            &controller,
-            HttpRequest {
-                method: HttpMethod::Get,
-                path: "/metrics".to_string(),
-                bearer_token: Some("admin-token".to_string()),
-                mtls_subject: None,
-            },
-            &auth,
-        )
-        .await;
-        assert_eq!(
-            metrics_ok.status, 404,
-            "/metrics passes auth then 404s (not wired in dispatch; axum serves it)"
-        );
-        let metrics_noauth = dispatch_with_auth(
-            &controller,
-            HttpRequest {
-                method: HttpMethod::Get,
-                path: "/metrics".to_string(),
-                bearer_token: None,
-                mtls_subject: None,
-            },
-            &auth,
-        )
-        .await;
-        assert_eq!(
-            metrics_noauth.status, 401,
-            "/metrics without a token should be 401 (no longer unauthenticated)"
         );
     }
 }

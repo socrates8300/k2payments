@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use mx20022_crypto::auth::{constant_time_eq, parse_bearer_token};
+use mx20022_crypto::auth::{constant_time_eq, jwt_required_spec_claims, parse_bearer_token};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -185,24 +185,16 @@ fn authorize_jwt(
         .ok_or(AuthError::InvalidBearer)?;
 
     let mut validation = Validation::new(Algorithm::HS256);
-    // Build the required-claims set dynamically: exp is always required
-    // (jsonwebtoken default), and iss/aud are required *when configured*.
-    // Without requiring them, a token that omits the claim entirely bypasses
-    // the audience/issuer check (jsonwebtoken only validates the claim if it
-    // is present).
-    let mut required_spec_claims: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
     if let Some(iss) = &config.jwt_issuer {
         validation.set_issuer(&[iss]);
-        required_spec_claims.insert("iss");
     }
     if let Some(aud) = &config.jwt_audience {
         validation.set_audience(&[aud]);
-        required_spec_claims.insert("aud");
     }
-    if !required_spec_claims.is_empty() {
-        validation.set_required_spec_claims(&required_spec_claims.into_iter().collect::<Vec<_>>());
-    }
+    validation.set_required_spec_claims(&jwt_required_spec_claims(
+        config.jwt_issuer.as_deref(),
+        config.jwt_audience.as_deref(),
+    ));
 
     let data = decode::<JwtClaims>(
         token,
@@ -358,10 +350,7 @@ mod tests {
 
     #[test]
     fn jwt_audience_required_when_configured() {
-        // Regression: a token that omits the `aud` claim must be rejected
-        // when an audience is configured. Without requiring the claim,
-        // jsonwebtoken skips audience validation for claim-less tokens,
-        // letting them bypass the audience check.
+        // jsonwebtoken skips audience validation when the claim is absent.
         let cfg = AuthConfig {
             mode: AuthMode::JwtHs256,
             jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
@@ -408,6 +397,40 @@ mod tests {
         let result_ok =
             authorize_request(&cfg, AdminResource::Ready, Some(header_ok.as_str()), None);
         assert!(result_ok.is_ok(), "token with correct aud should pass");
+    }
+
+    #[test]
+    fn jwt_rejects_token_without_exp_when_audience_configured() {
+        #[derive(Debug, Serialize)]
+        struct ClaimsNoExp {
+            sub: String,
+            roles: Vec<String>,
+            aud: String,
+        }
+
+        let cfg = AuthConfig {
+            mode: AuthMode::JwtHs256,
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
+            jwt_audience: Some("mx20022-admin".to_string()),
+            ready_roles: vec!["admin.read".to_string()],
+            ..AuthConfig::default()
+        };
+        let token = encode(
+            &Header::default(),
+            &ClaimsNoExp {
+                sub: "operator".to_string(),
+                roles: vec!["admin.read".to_string()],
+                aud: "mx20022-admin".to_string(),
+            },
+            &EncodingKey::from_secret("test-secret".as_bytes()),
+        )
+        .expect("token should encode");
+        let header = format!("Bearer {token}");
+        let result = authorize_request(&cfg, AdminResource::Ready, Some(header.as_str()), None);
+        assert!(
+            matches!(result, Err(AuthError::InvalidBearer)),
+            "token missing exp should be rejected: {result:?}"
+        );
     }
 
     #[test]

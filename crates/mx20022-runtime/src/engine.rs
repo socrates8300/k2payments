@@ -714,9 +714,9 @@ auth_bearer_token = "secret"
     #[cfg(any(feature = "channel-http", feature = "channel-grpc"))]
     #[test]
     fn extract_inbound_auth_rejects_jwt_without_required_roles() {
-        // Regression: without required_roles, any token signed with the
-        // secret is fully authorized to ingest messages. Reject the config
-        // so operators must declare an explicit role gate.
+        // Without required_roles any token signed with the secret is fully
+        // authorized to ingest messages. Reject the config so operators must
+        // declare an explicit role gate.
         let cfg = channel_config_block(
             r#"
 auth_mode = "jwt_hs256"
@@ -887,12 +887,7 @@ participants = [{{ name = "message-logger" }}]
         app.shutdown_outbound_channels().await;
     }
 
-    /// End-to-end drain: POST a real message to the HTTP inbound, then fire
-    /// shutdown, and assert run_pipelines returns Ok within a timeout. This
-    /// exercises the full run path (axum handler -> mpsc queue -> semaphore ->
-    /// inner per-message JoinSet -> drain) that no other test covers, and
-    /// pins the Commit 6 fix that made per-message tasks visible to the
-    /// shutdown drain (previously they were detached and orphaned).
+    /// JoinSet so shutdown can drain in-flight process() tasks.
     #[cfg(feature = "channel-http")]
     #[tokio::test]
     async fn run_pipelines_drains_and_returns_ok_after_message_then_shutdown() {
@@ -921,19 +916,11 @@ participants = [{{ name = "message-logger" }}]
         // a pacs.008 payload. The message-logger participant completes the
         // transaction (no outbound channel in runnable_config, so process()
         // returns Ok after the participant runs).
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-                    .await
-                    .is_ok()
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("inbound http should become ready");
+        assert!(
+            mx20022_channels::wait_for_tcp(format!("127.0.0.1:{port}"), Duration::from_secs(2))
+                .await,
+            "inbound http should become ready"
+        );
 
         // POST a minimal pacs.008 payload via a raw HTTP/1.1 request over a
         // TCP socket (avoids adding reqwest as a dev-dependency just for this
