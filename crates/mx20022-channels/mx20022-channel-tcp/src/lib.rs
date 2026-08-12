@@ -129,9 +129,9 @@ impl InboundChannel for TcpInboundChannel {
                             )
                             .await
                         }
-                        Err(error) => Err(ChannelError::new(format!(
-                            "tls handshake failed: {error}"
-                        ))),
+                        Err(error) => {
+                            Err(ChannelError::new(format!("tls handshake failed: {error}")))
+                        }
                     },
                     None => {
                         process_connection(stream, framing, content_type, auth_token, sender).await
@@ -351,15 +351,11 @@ fn decode_utf8_payload(payload: &[u8]) -> Result<String, ChannelError> {
 /// Load a cert chain + private key from PEM files and build a TLS acceptor.
 /// Mirrors the admin host's axum_server TLS path but uses tokio-rustls
 /// directly so the TCP channel can wrap raw accepted streams.
-fn build_tls_acceptor(
-    cert_path: &str,
-    key_path: &str,
-) -> Result<TlsAcceptor, ChannelError> {
-    let certs: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_file_iter(cert_path)
-            .map_err(|e| ChannelError::new(format!("failed to open tls_cert `{cert_path}`: {e}")))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ChannelError::new(format!("failed to parse tls_cert `{cert_path}`: {e}")))?;
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, ChannelError> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| ChannelError::new(format!("failed to open tls_cert `{cert_path}`: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ChannelError::new(format!("failed to parse tls_cert `{cert_path}`: {e}")))?;
     if certs.is_empty() {
         return Err(ChannelError::new(format!(
             "tls_cert `{cert_path}` contained no certificates"
@@ -368,14 +364,13 @@ fn build_tls_acceptor(
     let key = PrivateKeyDer::from_pem_file(key_path)
         .map_err(|e| ChannelError::new(format!("failed to load tls_key `{key_path}`: {e}")))?;
 
-    let config = ServerConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .map_err(|e| ChannelError::new(format!("tls protocol version selection failed: {e}")))?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(|e| ChannelError::new(format!("tls server config build failed: {e}")))?;
+    let config =
+        ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| ChannelError::new(format!("tls protocol version selection failed: {e}")))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| ChannelError::new(format!("tls server config build failed: {e}")))?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -484,7 +479,10 @@ mod tests {
         // that intermittently raced the accept loop under CI load.
         let ready = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if TcpStream::connect(format!("127.0.0.1:{port}")).await.is_ok() {
+                if TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .is_ok()
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

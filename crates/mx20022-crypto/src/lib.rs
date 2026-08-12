@@ -136,8 +136,7 @@ mod tests {
     use crate::{CryptoService, EncryptedBlob};
 
     // 48-byte high-entropy test key (> MIN_MASTER_KEY_BYTES of 32).
-    const TEST_MASTER_KEY: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_MASTER_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -167,12 +166,10 @@ mod tests {
 
     #[test]
     fn decrypt_fails_with_wrong_key() {
-        let crypto_a =
-            CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto A");
-        let crypto_b = CryptoService::from_master_key(
-            "abcdef0123456789abcdef0123456789abcdef0123456789ab",
-        )
-        .expect("crypto B");
+        let crypto_a = CryptoService::from_master_key(TEST_MASTER_KEY).expect("crypto A");
+        let crypto_b =
+            CryptoService::from_master_key("abcdef0123456789abcdef0123456789abcdef0123456789ab")
+                .expect("crypto B");
         let blob = crypto_a.encrypt(b"secret").expect("encrypt");
         let result = crypto_b.decrypt(&blob);
         assert!(result.is_err());

@@ -384,12 +384,7 @@ mod tests {
         .expect("token should encode");
         let header = format!("Bearer {token}");
 
-        let result = authorize_request(
-            &cfg,
-            AdminResource::Ready,
-            Some(header.as_str()),
-            None,
-        );
+        let result = authorize_request(&cfg, AdminResource::Ready, Some(header.as_str()), None);
         assert!(
             matches!(result, Err(AuthError::InvalidBearer)),
             "token missing aud should be rejected: {result:?}"
@@ -410,12 +405,8 @@ mod tests {
         )
         .expect("token should encode");
         let header_ok = format!("Bearer {token_ok}");
-        let result_ok = authorize_request(
-            &cfg,
-            AdminResource::Ready,
-            Some(header_ok.as_str()),
-            None,
-        );
+        let result_ok =
+            authorize_request(&cfg, AdminResource::Ready, Some(header_ok.as_str()), None);
         assert!(result_ok.is_ok(), "token with correct aud should pass");
     }
 
